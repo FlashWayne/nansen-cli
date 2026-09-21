@@ -323,8 +323,9 @@ that cannot change the command line.
 With `--cache` on, every read the CLI makes through the Nansen API client is
 cached — all of `nansen research ...`, plus `alerts list` and `alerts get`.
 Never cached: `account`, `web search`, `web fetch`, the `alerts`
-create/update/toggle/delete commands, `agent`, and every `trade`, `bridge`,
-`wallet`, `perp` and `mcp` command.
+create/update/toggle/delete commands, `agent`, every `trade`, `bridge`, `wallet`
+and `mcp` command, and `perp` trading. The analytics commands `perp screener`
+and `perp leaderboard` are cached.
 
 Inspect and clear what is on disk:
 
@@ -335,10 +336,10 @@ nansen cache clear                 # delete cached API responses
 nansen cache clear cost-map        # or update-check, or all
 ```
 
-`nansen cache stats` reports aggregates only — no cached payload, request
-parameter or cache key is ever printed. `nansen cache clear` only ever deletes
-files in the cache it was pointed at: credentials, wallets, saved quotes and
-config are never touched.
+`nansen cache stats` reports aggregates only — it uses timestamp metadata, but
+no cached payload, request parameter or cache key is ever printed. `nansen
+cache clear` only ever deletes files in the cache it was pointed at:
+credentials, wallets, saved quotes and config are never touched.
 
 | Cache | Location | TTL |
 |-------|----------|-----|

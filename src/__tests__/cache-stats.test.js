@@ -44,7 +44,8 @@ function responseCacheDir() {
 function writeResponseEntry(key, body, ageSeconds = 0) {
   fs.mkdirSync(responseCacheDir(), { recursive: true });
   const file = path.join(responseCacheDir(), `${key}.json`);
-  fs.writeFileSync(file, JSON.stringify(body));
+  const timestamp = Date.now() - ageSeconds * 1000;
+  fs.writeFileSync(file, JSON.stringify({ timestamp, ...body }));
   const when = new Date(Date.now() - ageSeconds * 1000);
   fs.utimesSync(file, when, when);
   return file;
@@ -69,6 +70,7 @@ afterEach(() => {
   if (prevUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevUserProfile;
   fs.rmSync(tempHome, { recursive: true, force: true });
   vi.resetModules();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -135,6 +137,26 @@ describe('cache stats', () => {
     expect(atSixty.caches[0].expired_entries).toBe(1);
     // A TTL of 0 disables cache reads outright, so nothing on disk is live.
     expect(atZero.caches[0].expired_entries).toBe(1);
+  });
+
+  it('uses the cache timestamp rather than mtime when deciding expiry', async () => {
+    const file = writeResponseEntry(CACHE_KEY, { data: [1] }, 600);
+    const now = new Date();
+    fs.utimesSync(file, now, now);
+    const { collectCacheStats } = await freshModule('../cache-inspect.js');
+
+    const response = collectCacheStats({ responseTtlSeconds: 300 }).caches[0];
+
+    expect(response.oldest_age_seconds).toBeGreaterThanOrEqual(600);
+    expect(response.expired_entries).toBe(1);
+  });
+
+  it('counts corrupt entries as expired because the next read discards them', async () => {
+    fs.mkdirSync(responseCacheDir(), { recursive: true });
+    fs.writeFileSync(path.join(responseCacheDir(), `${CACHE_KEY}.json`), '{broken');
+    const { collectCacheStats } = await freshModule('../cache-inspect.js');
+
+    expect(collectCacheStats().caches[0].expired_entries).toBe(1);
   });
 
   it('ignores anything in the cache directory that is not a cache entry', async () => {
@@ -258,6 +280,47 @@ describe('cache clear', () => {
     clearCaches('responses');
     expect(fs.existsSync(outsider)).toBe(true);
   });
+
+  it('refuses a symlinked response cache directory', async () => {
+    const outsiderDir = path.join(tempHome, 'outside');
+    const outsider = path.join(outsiderDir, `${CACHE_KEY}.json`);
+    fs.mkdirSync(path.dirname(responseCacheDir()), { recursive: true });
+    fs.mkdirSync(outsiderDir);
+    fs.writeFileSync(outsider, JSON.stringify({ keep: true }));
+    fs.symlinkSync(outsiderDir, responseCacheDir());
+
+    const { collectCacheStats, clearCaches } = await freshModule('../cache-inspect.js');
+
+    expect(() => collectCacheStats()).toThrow(/symlinked response cache directory/);
+    expect(() => clearCaches('responses')).toThrow(/symlinked response cache directory/);
+    expect(fs.existsSync(outsider)).toBe(true);
+  });
+
+  it('ignores JSON files that are not response-cache digest entries', async () => {
+    fs.mkdirSync(responseCacheDir(), { recursive: true });
+    const unrelated = path.join(responseCacheDir(), 'important.json');
+    fs.writeFileSync(unrelated, JSON.stringify({ keep: true }));
+    const { collectCacheStats, clearCaches } = await freshModule('../cache-inspect.js');
+
+    expect(collectCacheStats().caches[0].entries).toBe(0);
+    clearCaches('responses');
+    expect(fs.existsSync(unrelated)).toBe(true);
+  });
+
+  it('reports filesystem access failures instead of pretending the cache is empty', async () => {
+    fs.mkdirSync(responseCacheDir(), { recursive: true });
+    const original = fs.readdirSync.bind(fs);
+    vi.spyOn(fs, 'readdirSync').mockImplementation(target => {
+      if (target === responseCacheDir()) {
+        throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      }
+      return original(target);
+    });
+    const { collectCacheStats, clearCaches } = await freshModule('../cache-inspect.js');
+
+    expect(() => collectCacheStats()).toThrow(/Cannot list cache path.*EACCES/);
+    expect(() => clearCaches('responses')).toThrow(/Cannot list cache path.*EACCES/);
+  });
 });
 
 describe('cache command', () => {
@@ -323,11 +386,10 @@ describe('cache command', () => {
     expect(text).toContain('WHAT CACHES');
   });
 
-  it('still shows help for an unknown subcommand instead of failing', async () => {
-    const { text } = await runCacheCommand(['nonsense']);
-
-    expect(text).toContain('Unknown cache subcommand: nonsense');
-    expect(text).toContain('SUBCOMMANDS');
+  it('rejects an unknown subcommand', async () => {
+    await expect(runCacheCommand(['nonsense'])).rejects.toThrow(
+      /Unknown cache subcommand: nonsense\. Use one of: stats, clear/,
+    );
   });
 });
 

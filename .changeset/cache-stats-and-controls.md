@@ -8,4 +8,4 @@ Add `nansen cache stats` and safe cache controls. `nansen cache stats` reports, 
 
 Which commands cache is now documented rather than guessable: `nansen schema` carries a `caching` section, `nansen cache` explains it in its own help, and `--cache`/`--no-cache` are listed in the schema's global options alongside `--cache-ttl`. `NANSEN_NO_CACHE=1` is a new flagless equivalent of `--no-cache`, for wrappers that cannot change the command line.
 
-Stats are aggregates only: no cached payload, request parameter, endpoint path or cache key is ever printed.
+Stats are aggregates only: only timestamp metadata is used, and no cached payload, request parameter, endpoint path or cache key is ever printed.

@@ -4019,17 +4019,12 @@ describe('cache command', () => {
     expect(logs.some(l => l.includes('Cleared 2'))).toBe(true);
   });
 
-  it('should show help for unknown subcommand', async () => {
-    const logs = [];
-    const mockDeps = {
-      log: (msg) => logs.push(msg),
-      exit: vi.fn()
-    };
-    const commands = buildCommands(mockDeps);
-    
-    await commands.cache(['unknown'], null, {}, {});
-    
-    expect(logs.some(l => l.includes('Unknown cache subcommand'))).toBe(true);
+  it('should reject an unknown subcommand', async () => {
+    const commands = buildCommands({ log: vi.fn(), exit: vi.fn() });
+
+    await expect(commands.cache(['unknown'], null, {}, {})).rejects.toThrow(
+      /Unknown cache subcommand: unknown\. Use one of: stats, clear/,
+    );
   });
 });
 

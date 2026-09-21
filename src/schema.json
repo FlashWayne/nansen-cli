@@ -2721,7 +2721,7 @@
     "disableWith": ["--no-cache", "NANSEN_NO_CACHE=1"],
     "ttlOption": "--cache-ttl <seconds>",
     "defaultTtlSeconds": 300,
-    "cachedCommands": "All research commands, plus alerts list and alerts get.",
+    "cachedCommands": "All research commands (including top-level perp screener and perp leaderboard), plus alerts list and alerts get.",
     "neverCached": [
       "account",
       "web search",
@@ -2734,7 +2734,7 @@
       "trade (all subcommands)",
       "bridge (all subcommands)",
       "wallet (all subcommands)",
-      "perp (all subcommands)",
+      "perp trading (order, cancel, close, leverage, transfer, approve-builder-fee, positions, orders, account, meta)",
       "mcp (all subcommands)"
     ],
     "inspect": "nansen cache stats",

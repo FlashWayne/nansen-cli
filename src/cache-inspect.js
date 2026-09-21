@@ -7,10 +7,9 @@
  *   cost-map      ~/.nansen/cost-map.json        (cost-cache.js)   TTL 24h
  *   update-check  ~/.nansen/update-check.json    (update-check.js) TTL 24h
  *
- * Privacy: stats are built from directory listings and stat(2) alone. No cache
- * file is ever opened, so a cached response body, an API key, a wallet address
- * or a request parameter cannot reach the output by construction. Response
- * cache filenames are digests of the request, and they are not printed either.
+ * Privacy: stats extract each cache's timestamp metadata and never retain or
+ * render payload fields. Response cache filenames are digests of the request,
+ * and they are not printed either.
  *
  * Safety: clearing only ever unlinks regular files at the three paths above —
  * `.json` entries directly inside the response cache directory, and the two
@@ -28,6 +27,7 @@ import { getCostMapFile, COST_MAP_TTL_MS } from './cost-cache.js';
 import { getUpdateCheckFile, UPDATE_CHECK_TTL_MS } from './update-check.js';
 
 const SECOND = 1000;
+const RESPONSE_ENTRY = /^[0-9a-f]{64}\.json$/;
 
 /** Cache names, in report order. */
 export const CACHE_NAMES = ['responses', 'cost-map', 'update-check'];
@@ -56,6 +56,7 @@ function namespaces() {
       description: 'per-endpoint credit costs used to report what a call cost',
       kind: 'file',
       dirOrFile: getCostMapFile(),
+      timestampField: 'fetchedAt',
       ttlSeconds: COST_MAP_TTL_MS / SECOND,
     },
     {
@@ -64,52 +65,92 @@ function namespaces() {
       description: 'latest published CLI version, for the upgrade notice',
       kind: 'file',
       dirOrFile: getUpdateCheckFile(),
+      timestampField: 'checkedAt',
       ttlSeconds: UPDATE_CHECK_TTL_MS / SECOND,
     },
   ];
 }
 
 /**
- * Regular `.json` files directly inside `dir`, with size and mtime. A missing
- * directory is an empty cache, not an error. lstat (not stat) means a symlink
- * is reported as what it is and then skipped, so neither stats nor clear can be
- * walked out of the cache directory.
+ * Regular digest-named `.json` files directly inside `dir`, with size and,
+ * when requested, timestamp metadata. A missing directory is an empty cache,
+ * not an error. lstat (not stat) means symlinked entries are skipped; the
+ * directory itself is also rejected if it is a symlink.
  */
-function listDirEntries(dir) {
+function fsError(action, target, error) {
+  const detail = error?.code ? `[${error.code}] ${error.message}` : String(error);
+  return new Error(`Cannot ${action} cache path ${target}: ${detail}`);
+}
+
+function readTimestamp(file, field) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { raced: true };
+    throw fsError('read', file, error);
+  }
+  try {
+    const value = JSON.parse(raw)?.[field];
+    return { timestampMs: Number.isFinite(value) ? value : null };
+  } catch {
+    // A corrupt cache is dead to its owner and therefore already expired.
+    return { timestampMs: null };
+  }
+}
+
+function listDirEntries(dir, { readMetadata = false } = {}) {
   let names;
   try {
+    const dirStat = fs.lstatSync(dir);
+    if (dirStat.isSymbolicLink()) {
+      throw new Error(`Refusing to use symlinked response cache directory: ${dir}`);
+    }
+    if (!dirStat.isDirectory()) {
+      throw new Error(`Response cache path is not a directory: ${dir}`);
+    }
     names = fs.readdirSync(dir);
-  } catch {
-    return [];
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    if (error?.message?.startsWith('Refusing') || error?.message?.startsWith('Response cache')) throw error;
+    throw fsError('list', dir, error);
   }
   const entries = [];
   for (const name of names) {
-    if (!name.endsWith('.json')) continue;
+    if (!RESPONSE_ENTRY.test(name)) continue;
     const file = path.join(dir, name);
     try {
       const stat = fs.lstatSync(file);
       if (!stat.isFile()) continue;
-      entries.push({ file, bytes: stat.size, mtimeMs: stat.mtimeMs });
-    } catch {
-      // Raced with another process removing it — treat as already gone.
+      const metadata = readMetadata ? readTimestamp(file, 'timestamp') : {};
+      if (metadata.raced) continue;
+      entries.push({ file, bytes: stat.size, ...metadata });
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
     }
   }
   return entries;
 }
 
 /** The single file of a one-file cache, or nothing if it is absent. */
-function listFileEntry(file) {
+function listFileEntry(file, timestampField, { readMetadata = false } = {}) {
   try {
     const stat = fs.lstatSync(file);
     if (!stat.isFile()) return [];
-    return [{ file, bytes: stat.size, mtimeMs: stat.mtimeMs }];
-  } catch {
-    return [];
+    const metadata = readMetadata ? readTimestamp(file, timestampField) : {};
+    if (metadata.raced) return [];
+    return [{ file, bytes: stat.size, ...metadata }];
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
   }
 }
 
-function listEntries(ns) {
-  return ns.kind === 'dir' ? listDirEntries(ns.dirOrFile) : listFileEntry(ns.dirOrFile);
+function listEntries(ns, options) {
+  return ns.kind === 'dir'
+    ? listDirEntries(ns.dirOrFile, options)
+    : listFileEntry(ns.dirOrFile, ns.timestampField, options);
 }
 
 /**
@@ -124,10 +165,11 @@ export function collectCacheStats({ responseTtlSeconds = DEFAULT_CACHE_TTL, now 
   let totalBytes = 0;
 
   for (const ns of namespaces()) {
-    const entries = listEntries(ns);
+    const entries = listEntries(ns, { readMetadata: true });
     const ttlSeconds = ns.name === 'responses' ? responseTtlSeconds : ns.ttlSeconds;
     // A file stamped in the future (clock skew) is 0s old, never negative.
-    const ages = entries.map(e => Math.max(0, Math.round((now - e.mtimeMs) / SECOND)));
+    const rawAges = entries.map(e => e.timestampMs == null ? null : Math.max(0, (now - e.timestampMs) / SECOND));
+    const ages = rawAges.filter(age => age != null).map(Math.round);
     const bytes = entries.reduce((sum, e) => sum + e.bytes, 0);
 
     totalEntries += entries.length;
@@ -143,7 +185,7 @@ export function collectCacheStats({ responseTtlSeconds = DEFAULT_CACHE_TTL, now 
       oldest_age_seconds: ages.length ? Math.max(...ages) : null,
       newest_age_seconds: ages.length ? Math.min(...ages) : null,
       // A TTL of 0 disables cache reads, so every entry is already dead.
-      expired_entries: ages.filter(age => ttlSeconds <= 0 || age > ttlSeconds).length,
+      expired_entries: rawAges.filter(age => age == null || ttlSeconds <= 0 || age > ttlSeconds).length,
     });
   }
 
@@ -177,12 +219,12 @@ export function clearCaches(target) {
     if (!wanted.includes(ns.name)) continue;
     let entries = 0;
     let bytes = 0;
-    for (const entry of listEntries(ns)) {
+    for (const entry of listEntries(ns, { readMetadata: false })) {
       try {
         fs.unlinkSync(entry.file);
-      } catch {
-        // Already gone, or not ours to remove — do not count it as removed.
-        continue;
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue;
+        throw fsError('delete', entry.file, error);
       }
       entries += 1;
       bytes += entry.bytes;

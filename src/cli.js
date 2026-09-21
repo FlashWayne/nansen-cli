@@ -994,8 +994,8 @@ WHAT CACHES:
   written to the response cache — that is all of "nansen research ...", plus
   "alerts list" and "alerts get".
   Never cached: account, web search, web fetch, alerts create/update/toggle/delete,
-  agent (streamed), and every trade, bridge, wallet, perp and mcp command, which
-  do not go through that client at all.
+  agent (streamed), every trade, bridge, wallet and mcp command, and perp trading.
+  The analytics commands "perp screener" and "perp leaderboard" are cached.
 
 CACHE OPTIONS (for any command):
   --cache               Enable caching for this invocation
@@ -1453,9 +1453,10 @@ export function buildCommands(deps = {}) {
       };
 
       if (!handlers[subcommand]) {
-        log(`Unknown cache subcommand: ${subcommand}`);
-        handlers['help']();
-        return;
+        throw new NansenError(
+          `Unknown cache subcommand: ${subcommand}. Use one of: stats, clear`,
+          ErrorCode.INVALID_PARAMS,
+        );
       }
 
       return handlers[subcommand]();
@@ -2150,13 +2151,13 @@ export async function runCLI(rawArgs, deps = {}) {
   const stream = flags.stream || flags.s;
   const csv = options.format === 'csv';
 
-  // `auth` and `doctor --offline` promise zero network activity — that
-  // contract covers the background update-check fetch and telemetry too,
-  // not just the command's own requests.
+  // Offline commands promise zero network activity. That contract covers the
+  // background update-check fetch and telemetry too, not just the command's
+  // own requests.
   const isMcpUsage = command === 'mcp' && (subcommand !== 'verify' || flags.help || flags.h);
   // `completion` renders from the checked-in schema — no network, and its
   // stdout is piped straight into a shell, so keep the update check out of it.
-  const isOfflineCommand = command === 'auth' || (command === 'doctor' && flags.offline) || isMcpUsage || command === 'completion';
+  const isOfflineCommand = command === 'auth' || (command === 'doctor' && flags.offline) || isMcpUsage || command === 'completion' || command === 'cache';
   // `cache` reports on and deletes cache files. The background update check
   // writes ~/.nansen/update-check.json and the cost map refresh writes
   // ~/.nansen/cost-map.json — either would repopulate a cache the user just
@@ -2166,8 +2167,8 @@ export async function runCLI(rawArgs, deps = {}) {
   const trackFailed = isOfflineCommand ? async () => {} : trackCommandFailed;
 
   // Update check (read cached result + schedule background refresh)
-  const updateNotification = getUpdateNotification(VERSION);
-  const upgradeNotice = getUpgradeNotice(VERSION);
+  const updateNotification = isOfflineCommand ? null : getUpdateNotification(VERSION);
+  const upgradeNotice = isOfflineCommand ? null : getUpgradeNotice(VERSION);
   if (!isOfflineCommand && mayRefreshCaches) scheduleUpdateCheck();
   const notify = () => {
     if (upgradeNotice) errorOutput(upgradeNotice);
