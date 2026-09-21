@@ -83,12 +83,22 @@ function fsError(action, target, error) {
 }
 
 function readTimestamp(file, field) {
+  let fd;
   let raw;
   try {
-    raw = fs.readFileSync(file, 'utf8');
+    // Open the already-validated entry without following a final-component
+    // symlink. This closes the lstat/read TOCTOU window: even if an entry is
+    // replaced after listDirEntries checks it, the cache inspector cannot be
+    // redirected to an arbitrary file. Reading through the descriptor also
+    // keeps the directory-derived path out of readFileSync's path sink.
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    if (!fs.fstatSync(fd).isFile()) return { raced: true };
+    raw = fs.readFileSync(fd, 'utf8');
   } catch (error) {
-    if (error?.code === 'ENOENT') return { raced: true };
+    if (error?.code === 'ENOENT' || error?.code === 'ELOOP') return { raced: true };
     throw fsError('read', file, error);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
   }
   try {
     const value = JSON.parse(raw)?.[field];

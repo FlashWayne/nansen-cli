@@ -287,6 +287,28 @@ describe('cache clear', () => {
     expect(fs.existsSync(outsider)).toBe(true);
   });
 
+  it('refuses a digest entry replaced by a symlink between lstat and read', async () => {
+    const outsider = path.join(tempHome, 'important.json');
+    fs.writeFileSync(outsider, JSON.stringify({ timestamp: Date.now(), keep: true }));
+    fs.mkdirSync(responseCacheDir(), { recursive: true });
+    const entry = path.join(responseCacheDir(), `${CACHE_KEY}.json`);
+    fs.symlinkSync(outsider, entry);
+
+    // Simulate the narrow race after listDirEntries has observed a regular
+    // file but before readTimestamp opens it. O_NOFOLLOW must still prevent
+    // reading the replacement symlink's target.
+    const originalLstat = fs.lstatSync.bind(fs);
+    const regularFileStat = originalLstat(outsider);
+    vi.spyOn(fs, 'lstatSync').mockImplementation(target => (
+      target === entry ? regularFileStat : originalLstat(target)
+    ));
+
+    const { collectCacheStats } = await freshModule('../cache-inspect.js');
+
+    expect(collectCacheStats().caches[0].entries).toBe(0);
+    expect(fs.existsSync(outsider)).toBe(true);
+  });
+
   it('refuses a symlinked response cache directory', async () => {
     const outsiderDir = path.join(tempHome, 'outside');
     const outsider = path.join(outsiderDir, `${CACHE_KEY}.json`);
