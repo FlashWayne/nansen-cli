@@ -52,7 +52,6 @@ const MOCK_ALERTS = [
   },
 ];
 
-// Simple HTTP server to handle /api/v1/smart-alert/past-alerts
 const httpServer = http.createServer((req, res) => {
   if (req.url?.startsWith('/api/v1/smart-alert/past-alerts')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -85,7 +84,6 @@ wss.on('connection', (ws, req) => {
     serverTime: new Date().toISOString(),
   }));
 
-  // Handle pings
   ws.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
@@ -97,7 +95,6 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  // Fire mock alerts on interval
   let alertIndex = 0;
   const interval = setInterval(() => {
     if (ws.readyState !== ws.OPEN) {

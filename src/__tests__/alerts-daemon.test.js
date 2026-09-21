@@ -15,7 +15,7 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { buildDaemonChildArgv, buildDaemonCommand, resolveRestUrl } from '../commands/daemon.js';
+import { buildDaemonChildArgv, buildDaemonCommand, readLastNonEmptyLines, resolveRestUrl } from '../commands/daemon.js';
 import { AlertsDaemon, interpolateCommand } from '../daemon/alerts-daemon.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -652,6 +652,58 @@ describe('AlertsDaemon', () => {
 });
 
 describe('daemon command', () => {
+  it('reads the correct 50-line log tail without reading a large file in full', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-log-tail-'));
+    const logFile = path.join(dir, 'daemon.log');
+    const expectedLines = Array.from({ length: 60 }, (_, index) => `line-${index}`);
+    fs.writeFileSync(logFile, `${'x'.repeat(2 * 1024 * 1024)}\n${expectedLines.join('\n')}\n`);
+    const readSync = vi.fn(fs.readSync.bind(fs));
+    const fsImpl = {
+      openSync: fs.openSync.bind(fs),
+      fstatSync: fs.fstatSync.bind(fs),
+      readSync,
+      closeSync: fs.closeSync.bind(fs),
+    };
+
+    try {
+      const tail = readLastNonEmptyLines(logFile, { fsImpl });
+      expect(tail.split('\n')).toEqual(expectedLines.slice(-50));
+      const totalRead = readSync.mock.results.reduce((sum, result) => sum + result.value, 0);
+      expect(totalRead).toBeLessThan(fs.statSync(logFile).size);
+      expect(totalRead).toBeLessThanOrEqual(64 * 1024);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('handles small logs, blank lines, and a missing final newline', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-log-small-'));
+    const logFile = path.join(dir, 'daemon.log');
+
+    try {
+      fs.writeFileSync(logFile, 'alpha\n\nβeta');
+      expect(readLastNonEmptyLines(logFile)).toBe('alpha\nβeta');
+      fs.writeFileSync(logFile, 'only line');
+      expect(readLastNonEmptyLines(logFile)).toBe('only line');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds a very long line without splitting a UTF-8 character', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-log-long-'));
+    const logFile = path.join(dir, 'daemon.log');
+
+    try {
+      fs.writeFileSync(logFile, `prefix\n${'é'.repeat(200)}`);
+      const tail = readLastNonEmptyLines(logFile, { chunkBytes: 37, maxBytes: 101 });
+      expect(tail).toBe(`…${'é'.repeat(50)}`);
+      expect(tail).not.toContain('�');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('builds a canonical daemon-only child invocation', () => {
     const argv = buildDaemonChildArgv({
       action: 'handler --mode env',

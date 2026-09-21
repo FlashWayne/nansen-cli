@@ -18,6 +18,9 @@ const DEFAULT_STATE_FILE = path.join(NANSEN_DIR, 'alerts-daemon-state.json');
 const STOP_POLL_INTERVAL_MS = 50;
 const STOP_POLL_ATTEMPTS = 100;
 const STARTUP_GRACE_MS = 250;
+const LOG_TAIL_LINES = 50;
+const LOG_TAIL_CHUNK_BYTES = 64 * 1024;
+const LOG_TAIL_MAX_BYTES = 1024 * 1024;
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]']);
 const CLI_ENTRYPOINT = fileURLToPath(new URL('../index.js', import.meta.url));
 
@@ -91,6 +94,51 @@ function removePidFileIfMatches(pidFile, expectedPid) {
     if (readPid(pidFile) === expectedPid) fs.unlinkSync(pidFile);
   } catch {
     // The PID file may already have been removed by `stop`.
+  }
+}
+
+function decodeUtf8FromPossibleBoundary(buffer, startsMidFile) {
+  let offset = 0;
+  if (startsMidFile) {
+    while (offset < buffer.length && (buffer[offset] & 0xc0) === 0x80) offset++;
+  }
+  return buffer.subarray(offset).toString('utf8');
+}
+
+export function readLastNonEmptyLines(filePath, {
+  fsImpl = fs,
+  lineCount = LOG_TAIL_LINES,
+  chunkBytes = LOG_TAIL_CHUNK_BYTES,
+  maxBytes = LOG_TAIL_MAX_BYTES,
+} = {}) {
+  const fd = fsImpl.openSync(filePath, 'r');
+  try {
+    const size = fsImpl.fstatSync(fd).size;
+    let position = size;
+    let bytesReadTotal = 0;
+    let buffers = [];
+    let lines = [];
+
+    while (position > 0 && bytesReadTotal < maxBytes && lines.length <= lineCount) {
+      const length = Math.min(chunkBytes, position, maxBytes - bytesReadTotal);
+      const start = position - length;
+      const buffer = Buffer.allocUnsafe(length);
+      const bytesRead = fsImpl.readSync(fd, buffer, 0, length, start);
+      if (bytesRead <= 0) break;
+      buffers.unshift(buffer.subarray(0, bytesRead));
+      position = start;
+      bytesReadTotal += bytesRead;
+      const text = decodeUtf8FromPossibleBoundary(Buffer.concat(buffers), position > 0);
+      lines = text.split('\n').map((line) => line.endsWith('\r') ? line.slice(0, -1) : line).filter(Boolean);
+    }
+
+    lines = lines.slice(-lineCount);
+    if (position > 0 && bytesReadTotal >= maxBytes && lines.length > 0) {
+      lines[0] = `…${lines[0]}`;
+    }
+    return lines.join('\n');
+  } finally {
+    fsImpl.closeSync(fd);
   }
 }
 
@@ -238,6 +286,7 @@ export function buildDaemonCommand(deps = {}) {
     killFn = process.kill.bind(process),
     waitFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     env = process.env,
+    fsImpl = fs,
   } = deps;
 
   return async (args, _apiInstance, flags, options) => {
@@ -454,14 +503,11 @@ export function buildDaemonCommand(deps = {}) {
 
       // ── logs ─────────────────────────────────────────────────────────────────
       'logs': async () => {
-        if (!fs.existsSync(logFile)) {
+        if (!fsImpl.existsSync(logFile)) {
           log(`No log file found at ${logFile}. Has the daemon been started?`);
           return;
         }
-        const content = fs.readFileSync(logFile, 'utf8');
-        const lines = content.split('\n').filter(Boolean);
-        const tail = lines.slice(-50).join('\n');
-        log(tail);
+        log(readLastNonEmptyLines(logFile, { fsImpl }));
       },
     };
 
