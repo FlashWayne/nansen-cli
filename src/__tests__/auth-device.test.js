@@ -108,3 +108,23 @@ it.each(['not-a-jwt', 'e30.e30.signature'])('reports malformed issued expiry as 
   expect(onIssued.mock.calls[0][0].refreshToken).toBe('synthetic-cleanup-authority');
   expect(onIssued.mock.calls[0][0]).not.toHaveProperty('expiresAt');
 });
+
+it('asks for a new login when issuance fails after consuming approval', async () => {
+  const fetchFn = vi.fn()
+    .mockResolvedValueOnce(response(200, grant()))
+    .mockResolvedValueOnce(response(500, { error: 'internal_error' }))
+    .mockResolvedValueOnce(response(400, { error: 'expired_token' }));
+  const onIssued = vi.fn();
+  const wait = vi.fn(async () => {});
+  const client = createDeviceClient({ audience: 'https://api.nansen.ai', fetchFn });
+  await expect(pairDevice(client, { wait, onPending: () => {}, onIssued })).rejects.toMatchObject({
+    code: 'PAIRING_EXPIRED',
+    message: 'The approval code expired or was consumed. Run nansen login again.',
+    provenUnissued: false,
+  });
+  expect(onIssued).not.toHaveBeenCalled();
+  expect(fetchFn.mock.calls.map(([url]) => new URL(url).pathname)).toEqual([
+    '/auth/device/authorize', '/auth/device/token', '/auth/device/token',
+  ]);
+  expect(wait.mock.calls.map(([ms]) => ms)).toEqual([5000, 10000]);
+});
