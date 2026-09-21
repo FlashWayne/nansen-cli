@@ -19,6 +19,7 @@ const DEFAULT_BASE_DELAY_MS = 5_000;
 const MAX_DELAY_MS = 300_000;
 const PING_INTERVAL_MS = 30_000;
 const PONG_TIMEOUT_MS = 10_000;
+const HANDSHAKE_TIMEOUT_MS = 15_000;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -29,10 +30,6 @@ function jitter(maxMs = 2000) {
 function backoffDelay(attempt, baseMs = DEFAULT_BASE_DELAY_MS) {
   const raw = baseMs * Math.pow(2, attempt) + jitter();
   return Math.min(raw, MAX_DELAY_MS);
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -114,6 +111,7 @@ export class AlertsDaemon extends EventEmitter {
     this._reconnectAttempt = 0;
     this._pingTimer = null;
     this._pongTimer = null;
+    this._cancelReconnectWait = null;
     this._state = readJsonSafe(this.stateFile) ?? {};
   }
 
@@ -128,6 +126,7 @@ export class AlertsDaemon extends EventEmitter {
 
   stop() {
     this._running = false;
+    this._cancelReconnectWait?.();
     this._clearTimers();
     if (this._ws) {
       try {
@@ -155,8 +154,23 @@ export class AlertsDaemon extends EventEmitter {
       const delay = backoffDelay(this._reconnectAttempt);
       this.log('info', `Reconnecting in ${Math.round(delay / 1000)}s (attempt ${this._reconnectAttempt + 1})`);
       this._reconnectAttempt++;
-      await sleep(delay);
+      await this._waitForReconnect(delay);
     }
+  }
+
+  _waitForReconnect(delay) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (this._cancelReconnectWait === finish) this._cancelReconnectWait = null;
+        resolve();
+      };
+      const timer = setTimeout(finish, delay);
+      this._cancelReconnectWait = finish;
+    });
   }
 
   async _connect() {
@@ -165,6 +179,7 @@ export class AlertsDaemon extends EventEmitter {
     return new Promise((resolve, reject) => {
       const ws = new WS(this.wsUrl, {
         headers: { apikey: this.apiKey },
+        handshakeTimeout: HANDSHAKE_TIMEOUT_MS,
       });
       this._ws = ws;
 
@@ -337,6 +352,12 @@ export class AlertsDaemon extends EventEmitter {
 
     this.log('info', `Replaying ${alerts.length} missed alert(s)`);
     for (const alert of alerts) {
+      const alertTime = Date.parse(alert?.firedAt);
+      const sinceTime = Date.parse(since);
+      if (Number.isFinite(alertTime) && Number.isFinite(sinceTime) && alertTime < sinceTime) {
+        this.log('debug', `Already-processed backfill alert ignored: ${alert.alertId ?? 'unknown'}`);
+        continue;
+      }
       this._handleMessage(alert);
     }
   }

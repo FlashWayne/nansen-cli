@@ -73,6 +73,14 @@ function isProcessRunning(pid) {
   }
 }
 
+function removeOwnedPidFile(pidFile) {
+  try {
+    if (readPid(pidFile) === process.pid) fs.unlinkSync(pidFile);
+  } catch {
+    // The PID file may already have been removed by `stop`.
+  }
+}
+
 export function buildDaemonCommand(deps = {}) {
   const { log = console.log, getApiKey } = deps;
 
@@ -134,15 +142,26 @@ export function buildDaemonCommand(deps = {}) {
           },
         });
 
-        // Graceful shutdown
-        process.on('SIGINT', () => { daemon.stop(); process.exit(0); });
-        process.on('SIGTERM', () => { daemon.stop(); process.exit(0); });
+        const shutdown = () => daemon.stop();
+        process.once('SIGINT', shutdown);
+        process.once('SIGTERM', shutdown);
 
-        await daemon.start();
+        try {
+          await daemon.start();
+        } finally {
+          process.off('SIGINT', shutdown);
+          process.off('SIGTERM', shutdown);
+          removeOwnedPidFile(pidFile);
+        }
       },
 
       // ── start ────────────────────────────────────────────────────────────────
       'start': async () => {
+        const apiKey = getApiKey?.() ?? process.env.NANSEN_API_KEY;
+        if (!apiKey) {
+          throw new Error('No API key found. Run: nansen login --api-key <key>');
+        }
+
         const pid = readPid(pidFile);
         if (isProcessRunning(pid)) {
           log(`Daemon already running (PID ${pid})`);
@@ -159,6 +178,7 @@ export function buildDaemonCommand(deps = {}) {
           ...(flags['action-env'] ? ['--action-env'] : []),
           ...(flags['no-backfill'] ? ['--no-backfill'] : []),
           ...(options['state-file'] ? ['--state-file', options['state-file']] : []),
+          '--pid-file', pidFile,
           '--log-file', logFile,
         ];
 
@@ -169,7 +189,7 @@ export function buildDaemonCommand(deps = {}) {
         });
         child.unref();
 
-        fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+        fs.mkdirSync(path.dirname(pidFile), { recursive: true, mode: 0o700 });
         fs.writeFileSync(pidFile, String(child.pid), { mode: 0o600 });
 
         log(`Daemon started (PID ${child.pid})`);

@@ -341,9 +341,59 @@ describe('AlertsDaemon', () => {
     });
     expect(backfilledAlerts.filter((a) => a.alertId === 'past-001')).toHaveLength(2);
   });
+
+  it('does not replay backfill alerts older than the saved cursor', async () => {
+    const { daemon } = makeDaemon();
+    const seen = [];
+    daemon.on('alert', (alert) => seen.push(alert.alertId));
+    daemon._state = {
+      lastAlertAt: '2026-03-20T10:00:00Z',
+      lastAlertId: 'already-seen',
+    };
+    daemon._fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        alerts: [
+          makeAlert({ alertId: 'older', firedAt: '2026-03-20T09:59:59Z' }),
+          makeAlert({ alertId: 'newer', firedAt: '2026-03-20T10:00:01Z' }),
+        ],
+      }),
+    });
+
+    await daemon._fetchPastAlerts(daemon._state.lastAlertAt);
+
+    expect(seen).toEqual(['newer']);
+  });
+
+  it('stop interrupts an active reconnect delay', async () => {
+    vi.useFakeTimers();
+
+    class ClosingMockWS extends EventEmitter {
+      constructor() {
+        super();
+        this.readyState = 1;
+        this.close = vi.fn();
+        setImmediate(() => this.emit('close', 1006, 'gone'));
+      }
+    }
+
+    const { daemon } = makeDaemon({ WebSocket: ClosingMockWS });
+    const started = daemon.start();
+    await vi.advanceTimersByTimeAsync(1);
+    daemon.stop();
+
+    await expect(started).resolves.toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+  });
 });
 
 describe('daemon command', () => {
+  it('refuses to start a background daemon without an API key', async () => {
+    const command = buildDaemonCommand({ log: vi.fn(), getApiKey: () => null });
+    await expect(command(['start'], null, {}, {})).rejects.toThrow('No API key found');
+  });
+
   it('does not treat an invalid PID file as a running daemon', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-test-'));
     const pidFile = path.join(dir, 'daemon.pid');

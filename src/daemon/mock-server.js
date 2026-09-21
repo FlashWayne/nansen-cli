@@ -11,8 +11,15 @@
 import { WebSocketServer } from 'ws';
 import http from 'http';
 
-const port = parseInt(process.argv.find((a, i, arr) => arr[i - 1] === '--port') ?? '9876');
-const intervalSec = parseInt(process.argv.find((a, i, arr) => arr[i - 1] === '--interval') ?? '10');
+const port = Number(process.argv.find((a, i, arr) => arr[i - 1] === '--port') ?? '9876');
+const intervalSec = Number(process.argv.find((a, i, arr) => arr[i - 1] === '--interval') ?? '10');
+
+if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+  throw new Error('--port must be an integer between 1 and 65535');
+}
+if (!Number.isFinite(intervalSec) || intervalSec <= 0) {
+  throw new Error('--interval must be a positive number of seconds');
+}
 
 const MOCK_ALERTS = [
   {
@@ -110,8 +117,15 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-httpServer.listen(port, () => {
+httpServer.listen(port, '127.0.0.1', () => {
   console.log(`[mock-server] Listening on ws://localhost:${port}/v1/smart-alert/stream`);
   console.log(`[mock-server] Firing alerts every ${intervalSec}s`);
   console.log(`[mock-server] REST: http://localhost:${port}/api/v1/smart-alert/past-alerts`);
 });
+
+const shutdown = () => {
+  for (const client of wss.clients) client.terminate();
+  wss.close(() => httpServer.close());
+};
+process.once('SIGINT', shutdown);
+process.once('SIGTERM', shutdown);
