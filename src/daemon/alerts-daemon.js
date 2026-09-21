@@ -84,6 +84,7 @@ export class AlertsDaemon extends EventEmitter {
    * @param {string}   [opts.restUrl]    /past-alerts endpoint base URL
    * @param {string}   [opts.action]     Shell command template to run per alert
    * @param {boolean}  [opts.actionEnv]  Pass alert JSON as NANSEN_ALERT env var (vs stdin)
+   * @param {boolean}  [opts.foreground] Emit alert NDJSON to stdout (direct run only)
    * @param {boolean}  [opts.backfill]   Fetch past alerts on (re)connect (default: true)
    * @param {string}   [opts.stateFile]  Path to state JSON
    * @param {string}   [opts.logFile]    Append logs to this file (null = stderr only)
@@ -101,6 +102,7 @@ export class AlertsDaemon extends EventEmitter {
     this.restUrl = opts.restUrl ?? DEFAULT_REST_URL;
     this.action = opts.action ?? null;
     this.actionEnv = opts.actionEnv ?? false;
+    this.foreground = opts.foreground ?? false;
     this.backfill = opts.backfill ?? true;
     this.stateFile = opts.stateFile ?? path.join(os.homedir(), '.nansen', 'alerts-daemon-state.json');
     this.logFile = opts.logFile ?? null;
@@ -287,7 +289,9 @@ export class AlertsDaemon extends EventEmitter {
         const recentAlertKeys = [...this._recentAlertKeys, alertKey].slice(-RECENT_ALERT_LIMIT);
         this._recentAlertKeys = new Set(recentAlertKeys);
         const statePatch = { recentAlertKeys };
-        if (!this._state.lastAlertAt || msg.firedAt >= this._state.lastAlertAt) {
+        const alertTime = Date.parse(msg.firedAt);
+        const cursorTime = Date.parse(this._state.lastAlertAt);
+        if (Number.isFinite(alertTime) && (!Number.isFinite(cursorTime) || alertTime >= cursorTime)) {
           statePatch.lastAlertAt = msg.firedAt;
           statePatch.lastAlertId = msg.alertId;
         }
@@ -318,8 +322,8 @@ export class AlertsDaemon extends EventEmitter {
   }
 
   _dispatchAlert(alert) {
-    // 1. Always emit as NDJSON on stdout (for pipe mode)
-    process.stdout.write(JSON.stringify(alert) + '\n');
+    // 1. Emit NDJSON only for an explicit foreground pipe-mode run.
+    if (this.foreground) process.stdout.write(JSON.stringify(alert) + '\n');
 
     // 2. Run --action hook if configured
     if (!this.action) return;

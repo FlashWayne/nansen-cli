@@ -11,7 +11,6 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
-import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import os from 'os';
@@ -63,6 +62,7 @@ function makeDaemon(opts = {}) {
     restUrl: 'http://localhost:9876/api/v1/smart-alert/past-alerts',
     stateFile,
     backfill: false,
+    foreground: true,
     WebSocket: MockWS,
     fetchFn: mockFetch,
     log: vi.fn(),
@@ -211,28 +211,24 @@ describe('AlertsDaemon', () => {
     }));
   });
 
-  it('delivers EOF to an environment-mode action instead of hanging', async () => {
-    let closed;
-    const spawnFn = (...args) => {
-      const child = spawn(...args);
-      closed = new Promise((resolve, reject) => {
-        child.once('close', resolve);
-        child.once('error', reject);
-      });
-      return child;
-    };
+  it('uses ignored stdin and accepts a mocked successful close in environment mode', () => {
+    const child = new EventEmitter();
+    const close = vi.fn();
+    child.on('close', close);
+    const spawnFn = vi.fn(() => child);
     const { daemon } = makeDaemon({
-      action: 'cat >/dev/null',
+      action: 'handler',
       actionEnv: true,
       spawnFn,
     });
 
     daemon._dispatchAlert(makeAlert());
+    child.emit('close', 0);
 
-    await expect(Promise.race([
-      closed,
-      new Promise((_, reject) => setTimeout(() => reject(new Error('action hung waiting for stdin EOF')), 1000)),
-    ])).resolves.toBe(0);
+    expect(spawnFn).toHaveBeenCalledWith('/bin/sh', ['-c', 'handler'], expect.objectContaining({
+      stdio: ['ignore', 'inherit', 'inherit'],
+    }));
+    expect(close).toHaveBeenCalledWith(0);
   });
 
   it('emits "alert" event and writes JSON to stdout', async () => {
@@ -257,6 +253,7 @@ describe('AlertsDaemon', () => {
       restUrl: 'http://localhost/past-alerts',
       stateFile: '/tmp/test-daemon-state3.json',
       backfill: false,
+      foreground: true,
       WebSocket: AlertMockWS,
       fetchFn: vi.fn(),
       log: vi.fn(),
@@ -277,6 +274,14 @@ describe('AlertsDaemon', () => {
     expect(line).toBeDefined();
     const parsed = JSON.parse(line.trim());
     expect(parsed.alertId).toBe('test-alert-001');
+  });
+
+  it('does not emit NDJSON in background mode', () => {
+    const { daemon } = makeDaemon({ foreground: false });
+
+    daemon._dispatchAlert(makeAlert());
+
+    expect(stdoutLines).toEqual([]);
   });
 
   it('sends ping and handles pong', async () => {
@@ -508,6 +513,48 @@ describe('AlertsDaemon', () => {
     }
   });
 
+  it('advances the cursor by parsed time across offsets and milliseconds', () => {
+    const { daemon } = makeDaemon();
+    daemon._dispatchAlert = vi.fn();
+    daemon._state.lastAlertAt = '2026-03-20T10:00:00.100Z';
+    daemon._state.lastAlertId = 'cursor';
+
+    daemon._handleMessage(makeAlert({
+      alertId: 'later',
+      firedAt: '2026-03-20T09:00:00.200-01:00',
+    }));
+
+    expect(daemon._state).toMatchObject({
+      lastAlertAt: '2026-03-20T09:00:00.200-01:00',
+      lastAlertId: 'later',
+    });
+  });
+
+  it('never regresses the cursor for older or invalid timestamps', () => {
+    const { daemon } = makeDaemon();
+    daemon._dispatchAlert = vi.fn();
+    daemon._state.lastAlertAt = '2026-03-20T10:00:00.900Z';
+    daemon._state.lastAlertId = 'cursor';
+
+    daemon._handleMessage(makeAlert({
+      alertId: 'offset-older',
+      firedAt: '2026-03-20T11:00:00+02:00',
+    }));
+    daemon._handleMessage(makeAlert({ alertId: 'invalid-time', firedAt: 'not-a-timestamp' }));
+
+    expect(daemon._state).toMatchObject({
+      lastAlertAt: '2026-03-20T10:00:00.900Z',
+      lastAlertId: 'cursor',
+    });
+
+    daemon._state.lastAlertAt = 'corrupt-cursor';
+    daemon._handleMessage(makeAlert({ alertId: 'recovered', firedAt: '2026-03-20T10:00:01Z' }));
+    expect(daemon._state).toMatchObject({
+      lastAlertAt: '2026-03-20T10:00:01Z',
+      lastAlertId: 'recovered',
+    });
+  });
+
   it('stop interrupts an active reconnect delay', async () => {
     vi.useFakeTimers();
 
@@ -554,6 +601,7 @@ describe('daemon command', () => {
       '--action', 'handler --mode env',
       '--action-env', '--no-backfill',
       '--state-file', '/tmp/state.json',
+      '--daemon-mode', 'background',
       '--log-file', '/tmp/daemon.log',
     ]);
     expect(argv).not.toContain('--pid-file');
@@ -565,8 +613,11 @@ describe('daemon command', () => {
     const pidFile = path.join(dir, 'daemon.pid');
     let resolveStart;
     let reportStarted;
+    let daemonOptions;
+    const spawnFn = vi.fn();
     const started = new Promise((resolve) => { reportStarted = resolve; });
     class FakeDaemon {
+      constructor(options) { daemonOptions = options; }
       start() {
         reportStarted();
         return new Promise((resolve) => { resolveStart = resolve; });
@@ -580,12 +631,14 @@ describe('daemon command', () => {
     const command = buildDaemonCommand({
       getApiKey: () => 'test-key',
       DaemonClass: FakeDaemon,
+      spawnFn,
       killFn,
     });
 
     try {
       const running = command(['run'], null, {}, { 'pid-file': pidFile });
       await started;
+      expect(daemonOptions).toEqual(expect.objectContaining({ foreground: true, spawnFn }));
       expect(fs.readFileSync(pidFile, 'utf8')).toBe(String(process.pid));
       await expect(command(['status'], null, {}, { 'pid-file': pidFile }))
         .resolves.toMatchObject({ running: true, pid: process.pid });
@@ -599,6 +652,29 @@ describe('daemon command', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('threads background output mode and injected spawn into the daemon', async () => {
+    let daemonOptions;
+    const spawnFn = vi.fn();
+    class FakeDaemon {
+      constructor(options) { daemonOptions = options; }
+      async start() {}
+      stop() {}
+    }
+    const command = buildDaemonCommand({
+      getApiKey: () => 'test-key',
+      DaemonClass: FakeDaemon,
+      spawnFn,
+    });
+
+    await command(['run'], null, {}, { 'daemon-mode': 'background' });
+
+    expect(daemonOptions).toEqual(expect.objectContaining({
+      foreground: false,
+      spawnFn,
+    }));
+  });
+
   it('derives backfill safely or requires an explicit REST URL', () => {
     expect(resolveRestUrl(
       'wss://custom.example/v1/smart-alert/stream?ignored=yes',

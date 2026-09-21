@@ -138,6 +138,7 @@ export function buildDaemonChildArgv(options, flags, logFile) {
     ...(flags['action-env'] ? ['--action-env'] : []),
     ...(flags['no-backfill'] ? ['--no-backfill'] : []),
     ...(options['state-file'] ? ['--state-file', options['state-file']] : []),
+    '--daemon-mode', 'background',
     '--log-file', logFile,
   ];
 }
@@ -196,8 +197,6 @@ function acquireLifecycleLock(pidFile, killFn) {
       };
     } catch (err) {
       if (err?.code !== 'EEXIST') throw err;
-      // Best-effort stale-lock cleanup. The acquired-lock release path above is
-      // stronger because it retains the original descriptor for its lifetime.
       let staleFd;
       try {
         staleFd = fs.openSync(lockFile, 'r');
@@ -246,10 +245,13 @@ export function buildDaemonCommand(deps = {}) {
       return;
     }
 
-    for (const key of ['action', 'ws-url', 'rest-url', 'state-file', 'pid-file', 'log-file']) {
+    for (const key of ['action', 'ws-url', 'rest-url', 'state-file', 'pid-file', 'log-file', 'daemon-mode']) {
       if (options[key] !== undefined && (typeof options[key] !== 'string' || !options[key])) {
         throw new Error(`--${key} must be a non-empty string`);
       }
+    }
+    if (options['daemon-mode'] !== undefined && options['daemon-mode'] !== 'background') {
+      throw new Error('--daemon-mode must be background');
     }
 
     if (options['ws-url']) {
@@ -282,9 +284,11 @@ export function buildDaemonCommand(deps = {}) {
           restUrl,
           action: options.action,
           actionEnv: flags['action-env'],
+          foreground: options['daemon-mode'] !== 'background',
           backfill: !flags['no-backfill'],
           stateFile,
           logFile: options['log-file'] ?? null,
+          spawnFn,
           log: (level, message) => {
             process.stderr.write(`[${new Date().toISOString()}] [${level.toUpperCase()}] ${message}\n`);
           },
@@ -436,7 +440,6 @@ export function buildDaemonCommand(deps = {}) {
           log(`No log file found at ${logFile}. Has the daemon been started?`);
           return;
         }
-        // Tail last 50 lines
         const content = fs.readFileSync(logFile, 'utf8');
         const lines = content.split('\n').filter(Boolean);
         const tail = lines.slice(-50).join('\n');
