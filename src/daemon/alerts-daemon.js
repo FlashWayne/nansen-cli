@@ -56,7 +56,7 @@ function readJsonSafe(filePath) {
  * Alert data payload is NOT interpolated — only top-level string fields.
  * This prevents any injection from alert content into the shell command.
  */
-function interpolateCommand(template, alert) {
+export function interpolateCommand(template, alert) {
   return template
     .replace(/\{alertId\}/g, sanitizeShell(alert.alertId ?? ''))
     .replace(/\{alertName\}/g, sanitizeShell(alert.alertName ?? ''))
@@ -70,7 +70,7 @@ function interpolateCommand(template, alert) {
  * so we only allow a safe subset: alphanumeric, dash, underscore, dot, colon, slash, @.
  */
 function sanitizeShell(str) {
-  return String(str).replace(/[^a-zA-Z0-9\-_.:/@ ]/g, '');
+  return String(str).replace(/[^a-zA-Z0-9\-_.:/@]/g, '');
 }
 
 // ── AlertsDaemon ──────────────────────────────────────────────────────────────
@@ -369,12 +369,18 @@ export class AlertsDaemon extends EventEmitter {
     this._pingTimer = setInterval(() => {
       if (this._ws?.readyState === 1 /* OPEN */) {
         this._ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
-        this._pongTimer = setTimeout(() => {
-          this.log('warn', 'Pong timeout — forcing reconnect');
-          this._ws?.close();
-        }, PONG_TIMEOUT_MS);
+        this._schedulePongTimeout();
       }
     }, PING_INTERVAL_MS);
+  }
+
+  _schedulePongTimeout() {
+    this._clearPongTimer();
+    this._pongTimer = setTimeout(() => {
+      this._pongTimer = null;
+      this.log('warn', 'Pong timeout — forcing reconnect');
+      this._ws?.close();
+    }, PONG_TIMEOUT_MS);
   }
 
   _clearPongTimer() {

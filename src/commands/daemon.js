@@ -82,7 +82,7 @@ function removeOwnedPidFile(pidFile) {
 }
 
 export function buildDaemonCommand(deps = {}) {
-  const { log = console.log, getApiKey } = deps;
+  const { log = console.log, getApiKey, spawnFn } = deps;
 
   return async (args, _apiInstance, flags, options) => {
     const sub = args[0];
@@ -169,7 +169,7 @@ export function buildDaemonCommand(deps = {}) {
         }
 
         // Spawn detached child
-        const { spawn } = await import('child_process');
+        const spawn = spawnFn ?? (await import('child_process')).spawn;
         const argv = [
           ...process.argv.slice(0, 2), // node + script path
           'alerts', 'daemon', 'run',
@@ -187,6 +187,13 @@ export function buildDaemonCommand(deps = {}) {
           stdio: 'ignore',
           env: process.env,
         });
+        if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
+          // A failed spawn may emit `error` after returning a pid-less child.
+          // Attach a listener so the actionable CLI error below is not followed
+          // by an unhandled EventEmitter error.
+          child.once?.('error', () => {});
+          throw new Error('Failed to start daemon: child process did not provide a valid PID');
+        }
         child.unref();
 
         fs.mkdirSync(path.dirname(pidFile), { recursive: true, mode: 0o700 });

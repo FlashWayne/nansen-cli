@@ -15,7 +15,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { buildDaemonCommand } from '../commands/daemon.js';
-import { AlertsDaemon } from '../daemon/alerts-daemon.js';
+import { AlertsDaemon, interpolateCommand } from '../daemon/alerts-daemon.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -86,6 +86,15 @@ describe('AlertsDaemon', () => {
 
   it('throws if no apiKey provided', () => {
     expect(() => new AlertsDaemon({})).toThrow('apiKey is required');
+  });
+
+  it('keeps interpolated alert fields within one shell token', () => {
+    const command = interpolateCommand('handler {alertName} {alertId}', {
+      alertName: 'Safe Name --extra-argument',
+      alertId: 'abc; touch /tmp/pwned',
+    });
+
+    expect(command).toBe('handler SafeName--extra-argument abctouch/tmp/pwned');
   });
 
   it('ignores non-object messages', () => {
@@ -221,6 +230,20 @@ describe('AlertsDaemon', () => {
     const pings = wsSendCalls.filter((m) => m.type === 'ping');
     expect(pings.length).toBeGreaterThan(0);
 
+    vi.useRealTimers();
+  });
+
+  it('keeps only one pending pong timeout', () => {
+    vi.useFakeTimers();
+    const { daemon } = makeDaemon();
+    daemon._ws = { close: vi.fn() };
+
+    daemon._schedulePongTimeout();
+    daemon._schedulePongTimeout();
+
+    expect(vi.getTimerCount()).toBe(1);
+    daemon.stop();
+    expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
   });
 
@@ -392,6 +415,30 @@ describe('daemon command', () => {
   it('refuses to start a background daemon without an API key', async () => {
     const command = buildDaemonCommand({ log: vi.fn(), getApiKey: () => null });
     await expect(command(['start'], null, {}, {})).rejects.toThrow('No API key found');
+  });
+
+  it('does not write a PID file when spawn returns an invalid PID', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-test-'));
+    const pidFile = path.join(dir, 'daemon.pid');
+    const child = { pid: undefined, once: vi.fn(), unref: vi.fn() };
+    const command = buildDaemonCommand({
+      log: vi.fn(),
+      getApiKey: () => 'test-key',
+      spawnFn: vi.fn(() => child),
+    });
+
+    try {
+      await expect(command(['start'], null, {}, {
+        'pid-file': pidFile,
+        'state-file': path.join(dir, 'state.json'),
+        'log-file': path.join(dir, 'daemon.log'),
+      })).rejects.toThrow('child process did not provide a valid PID');
+      expect(child.once).toHaveBeenCalledWith('error', expect.any(Function));
+      expect(child.unref).not.toHaveBeenCalled();
+      expect(fs.existsSync(pidFile)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('does not treat an invalid PID file as a running daemon', async () => {
