@@ -20,6 +20,7 @@ const MAX_DELAY_MS = 300_000;
 const PING_INTERVAL_MS = 30_000;
 const PONG_TIMEOUT_MS = 10_000;
 const HANDSHAKE_TIMEOUT_MS = 15_000;
+const RECENT_ALERT_LIMIT = 50;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -113,6 +114,16 @@ export class AlertsDaemon extends EventEmitter {
     this._pongTimer = null;
     this._cancelReconnectWait = null;
     this._state = readJsonSafe(this.stateFile) ?? {};
+    const recentAlertKeys = Array.isArray(this._state.recentAlertKeys)
+      ? this._state.recentAlertKeys.filter((key) => typeof key === 'string').slice(-RECENT_ALERT_LIMIT)
+      : [];
+    if (this._state.lastAlertId && this._state.lastAlertAt) {
+      const legacyLastKey = JSON.stringify([String(this._state.lastAlertId), String(this._state.lastAlertAt)]);
+      if (!recentAlertKeys.includes(legacyLastKey)) recentAlertKeys.push(legacyLastKey);
+    }
+    if (recentAlertKeys.length > RECENT_ALERT_LIMIT) recentAlertKeys.shift();
+    this._state.recentAlertKeys = recentAlertKeys;
+    this._recentAlertKeys = new Set(recentAlertKeys);
   }
 
   // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -209,8 +220,10 @@ export class AlertsDaemon extends EventEmitter {
       });
 
       ws.on('close', (code, reason) => {
-        this._clearTimers();
-        if (this._ws === ws) this._ws = null;
+        if (this._ws === ws) {
+          this._clearTimers();
+          this._ws = null;
+        }
         this.log('info', `Connection closed (code=${code} reason=${reason?.toString() ?? ''})`);
         resolve(); // let the loop decide whether to reconnect
       });
@@ -225,7 +238,15 @@ export class AlertsDaemon extends EventEmitter {
           else ws.close();
         } catch {
           reject(err);
+          return;
         }
+        if (this._ws === ws) {
+          this._clearTimers();
+          this._ws = null;
+        }
+        // Some WebSocket implementations do not emit `close` after a failed
+        // handshake. Always settle so the reconnect loop cannot hang forever.
+        resolve();
       });
     });
   }
@@ -246,23 +267,35 @@ export class AlertsDaemon extends EventEmitter {
         this.emit('connected', msg);
         break;
 
-      case 'alert':
+      case 'alert': {
         if (!msg.alertId || !msg.firedAt) {
           this.log('warn', 'Received invalid alert, ignoring');
           break;
         }
-        if (msg.alertId === this._state.lastAlertId && msg.firedAt === this._state.lastAlertAt) {
+        const alertKey = JSON.stringify([String(msg.alertId), String(msg.firedAt)]);
+        if (
+          this._recentAlertKeys.has(alertKey) ||
+          (msg.alertId === this._state.lastAlertId && msg.firedAt === this._state.lastAlertAt)
+        ) {
           this.log('debug', `Duplicate alert ignored: ${msg.alertId}`);
           break;
         }
         // Log only metadata — not alert data payload (may contain market-sensitive info)
         this.log('info', `Alert: [${msg.alertId}] ${msg.alertName} (${msg.alertType}) at ${msg.firedAt}`);
+        const recentAlertKeys = [...this._recentAlertKeys, alertKey].slice(-RECENT_ALERT_LIMIT);
+        this._recentAlertKeys = new Set(recentAlertKeys);
+        const statePatch = { recentAlertKeys };
         if (!this._state.lastAlertAt || msg.firedAt >= this._state.lastAlertAt) {
-          this._saveState({ lastAlertAt: msg.firedAt, lastAlertId: msg.alertId });
+          statePatch.lastAlertAt = msg.firedAt;
+          statePatch.lastAlertId = msg.alertId;
         }
+        // Persist deduplication state before dispatch so a crash/restart cannot
+        // invoke an action hook twice for the same alert.
+        this._saveState(statePatch);
         this.emit('alert', msg);
         this._dispatchAlert(msg);
         break;
+      }
 
       case 'pong':
         this._clearPongTimer();

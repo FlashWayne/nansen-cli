@@ -1123,6 +1123,10 @@
                   "type": "string",
                   "description": "Override WebSocket server URL"
                 },
+                "rest-url": {
+                  "type": "string",
+                  "description": "Override REST backfill URL (required for non-standard WebSocket paths)"
+                },
                 "state-file": {
                   "type": "string",
                   "description": "Path to state JSON (default: ~/.nansen/alerts-daemon-state.json)"
@@ -1151,6 +1155,10 @@
                 "ws-url": {
                   "type": "string",
                   "description": "Override WebSocket server URL"
+                },
+                "rest-url": {
+                  "type": "string",
+                  "description": "Override REST backfill URL (required for non-standard WebSocket paths)"
                 },
                 "state-file": {
                   "type": "string",

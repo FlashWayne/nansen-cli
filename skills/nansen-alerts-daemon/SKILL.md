@@ -52,6 +52,7 @@ missed alerts from the `/past-alerts` REST endpoint.
 | `--action-env` | Pass alert JSON as `NANSEN_ALERT` env var instead of stdin |
 | `--no-backfill` | Skip past-alert replay on (re)connect |
 | `--ws-url <url>` | Override WebSocket URL (e.g. local mock server) |
+| `--rest-url <url>` | Override REST backfill URL; required when `--ws-url` uses a non-standard path unless `--no-backfill` is set |
 | `--state-file <path>` | State JSON path (default: `~/.nansen/alerts-daemon-state.json`) |
 | `--pid-file <path>` | PID file path (default: `~/.nansen/alerts-daemon.pid`) |
 | `--log-file <path>` | Log file path (default: `~/.nansen/alerts-daemon.log`) |

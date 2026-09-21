@@ -14,7 +14,7 @@ import { EventEmitter } from 'events';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { buildDaemonCommand } from '../commands/daemon.js';
+import { buildDaemonCommand, resolveRestUrl } from '../commands/daemon.js';
 import { AlertsDaemon, interpolateCommand } from '../daemon/alerts-daemon.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -30,6 +30,9 @@ function makeAlert(overrides = {}) {
     ...overrides,
   };
 }
+
+let daemonCounter = 0;
+const temporaryStateFiles = [];
 
 function makeDaemon(opts = {}) {
   class MockWS extends EventEmitter {
@@ -50,11 +53,13 @@ function makeDaemon(opts = {}) {
     json: async () => ({ alerts: [], count: 0 }),
   });
 
+  const stateFile = opts.stateFile ?? path.join(os.tmpdir(), `nansen-daemon-${process.pid}-${++daemonCounter}.json`);
+  if (!opts.stateFile) temporaryStateFiles.push(stateFile);
   const daemon = new AlertsDaemon({
     apiKey: 'test-key',
     wsUrl: 'ws://localhost:9876/v1/smart-alert/stream',
     restUrl: 'http://localhost:9876/api/v1/smart-alert/past-alerts',
-    stateFile: '/tmp/test-daemon-state.json',
+    stateFile,
     backfill: false,
     WebSocket: MockWS,
     fetchFn: mockFetch,
@@ -82,6 +87,9 @@ describe('AlertsDaemon', () => {
 
   afterEach(() => {
     process.stdout.write = originalStdoutWrite;
+    for (const stateFile of temporaryStateFiles.splice(0)) {
+      try { fs.unlinkSync(stateFile); } catch { /* file may not have been written */ }
+    }
   });
 
   it('throws if no apiKey provided', () => {
@@ -148,6 +156,24 @@ describe('AlertsDaemon', () => {
 
     expect(conn.sessionId).toBe('sess-abc');
     expect(headers).toEqual({ apikey: 'test-key' });
+  });
+
+  it('settles a failed connection even when the socket never emits close', async () => {
+    let socket;
+    class ErrorOnlyMockWS extends EventEmitter {
+      constructor() {
+        super();
+        socket = this;
+        this.terminate = vi.fn();
+        setImmediate(() => this.emit('error', new Error('DNS lookup failed')));
+      }
+    }
+
+    const { daemon } = makeDaemon({ WebSocket: ErrorOnlyMockWS });
+
+    await expect(daemon._connect()).resolves.toBeUndefined();
+    expect(socket.terminate).toHaveBeenCalledOnce();
+    expect(daemon._ws).toBeNull();
   });
 
   it('emits "alert" event and writes JSON to stdout', async () => {
@@ -388,6 +414,41 @@ describe('AlertsDaemon', () => {
     expect(seen).toEqual(['newer']);
   });
 
+  it('persists a bounded deduplication window before dispatch', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-dedup-'));
+    const stateFile = path.join(dir, 'state.json');
+
+    try {
+      const { daemon } = makeDaemon({ stateFile });
+      daemon._dispatchAlert = vi.fn();
+      const first = makeAlert({ alertId: 'first', firedAt: '2026-03-20T10:00:00Z' });
+      const second = makeAlert({ alertId: 'second', firedAt: '2026-03-20T10:00:01Z' });
+
+      daemon._handleMessage(first);
+      daemon._handleMessage(second);
+      daemon._handleMessage(first);
+
+      expect(daemon._dispatchAlert).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).recentAlertKeys).toHaveLength(2);
+
+      const { daemon: restarted } = makeDaemon({ stateFile });
+      restarted._dispatchAlert = vi.fn();
+      restarted._handleMessage(second);
+      expect(restarted._dispatchAlert).not.toHaveBeenCalled();
+
+      for (let index = 0; index < 55; index++) {
+        restarted._handleMessage(makeAlert({
+          alertId: `bounded-${index}`,
+          firedAt: new Date(Date.UTC(2026, 2, 20, 10, 1, index)).toISOString(),
+        }));
+      }
+      const persisted = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+      expect(persisted.recentAlertKeys).toHaveLength(50);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('stop interrupts an active reconnect delay', async () => {
     vi.useFakeTimers();
 
@@ -412,9 +473,39 @@ describe('AlertsDaemon', () => {
 });
 
 describe('daemon command', () => {
+  it('derives backfill safely or requires an explicit REST URL', () => {
+    expect(resolveRestUrl(
+      'wss://custom.example/v1/smart-alert/stream?ignored=yes',
+      undefined,
+      true,
+    )).toBe('https://custom.example/api/v1/smart-alert/past-alerts');
+    expect(resolveRestUrl(
+      'wss://custom.example/alerts',
+      'https://custom.example/backfill',
+      true,
+    )).toBe('https://custom.example/backfill');
+    expect(resolveRestUrl('wss://custom.example/alerts', undefined, false)).toBeUndefined();
+    expect(() => resolveRestUrl('wss://custom.example/alerts', undefined, true))
+      .toThrow('--rest-url is required');
+  });
+
   it('refuses to start a background daemon without an API key', async () => {
     const command = buildDaemonCommand({ log: vi.fn(), getApiKey: () => null });
     await expect(command(['start'], null, {}, {})).rejects.toThrow('No API key found');
+  });
+
+  it('refuses a non-standard WebSocket path without a REST backfill URL', async () => {
+    const spawnFn = vi.fn();
+    const command = buildDaemonCommand({
+      log: vi.fn(),
+      getApiKey: () => 'test-key',
+      spawnFn,
+    });
+
+    await expect(command(['start'], null, {}, {
+      'ws-url': 'wss://custom.example/alerts',
+    })).rejects.toThrow('--rest-url is required');
+    expect(spawnFn).not.toHaveBeenCalled();
   });
 
   it('does not write a PID file when spawn returns an invalid PID', async () => {
@@ -436,6 +527,80 @@ describe('daemon command', () => {
       expect(child.once).toHaveBeenCalledWith('error', expect.any(Function));
       expect(child.unref).not.toHaveBeenCalled();
       expect(fs.existsSync(pidFile)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the PID file until the daemon has exited', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-stop-'));
+    const pidFile = path.join(dir, 'daemon.pid');
+    const logs = [];
+    let signaled = false;
+    let postSignalChecks = 0;
+    fs.writeFileSync(pidFile, '4242');
+    const killFn = vi.fn((_pid, signal) => {
+      if (signal === 'SIGTERM') {
+        signaled = true;
+        return;
+      }
+      if (!signaled || postSignalChecks++ < 2) return;
+      throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+    });
+    const waitFn = vi.fn(async () => {
+      expect(fs.readFileSync(pidFile, 'utf8')).toBe('4242');
+    });
+    const command = buildDaemonCommand({
+      log: (line) => logs.push(line),
+      killFn,
+      waitFn,
+    });
+
+    try {
+      await command(['stop'], null, {}, { 'pid-file': pidFile });
+      expect(waitFn).toHaveBeenCalledTimes(2);
+      expect(fs.existsSync(pidFile)).toBe(false);
+      expect(logs).toContain('Daemon stopped (PID 4242)');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the PID file when graceful shutdown times out', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-stop-'));
+    const pidFile = path.join(dir, 'daemon.pid');
+    const logs = [];
+    fs.writeFileSync(pidFile, '4242');
+    const command = buildDaemonCommand({
+      log: (line) => logs.push(line),
+      killFn: vi.fn(),
+      waitFn: vi.fn(async () => {}),
+    });
+
+    try {
+      await command(['stop'], null, {}, { 'pid-file': pidFile });
+      expect(fs.readFileSync(pidFile, 'utf8')).toBe('4242');
+      expect(logs).toContain('Failed to stop daemon: PID 4242 did not exit within 5 seconds');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes lifecycle operations with an atomic lock', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-lock-'));
+    const pidFile = path.join(dir, 'daemon.pid');
+    fs.writeFileSync(`${pidFile}.lock`, String(process.pid));
+    const spawnFn = vi.fn();
+    const command = buildDaemonCommand({
+      log: vi.fn(),
+      getApiKey: () => 'test-key',
+      spawnFn,
+    });
+
+    try {
+      await expect(command(['start'], null, {}, { 'pid-file': pidFile }))
+        .rejects.toThrow('lifecycle operation already in progress');
+      expect(spawnFn).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
