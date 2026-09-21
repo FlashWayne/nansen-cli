@@ -112,6 +112,8 @@ export function resolveRestUrl(wsUrl, explicitRestUrl, backfill) {
   if (!wsUrl || !backfill) return undefined;
 
   const url = new URL(wsUrl);
+  // Nansen canonical stream path — update this inference alongside the API
+  // route if smart-alert streaming is versioned or moved.
   if (url.pathname !== '/v1/smart-alert/stream') {
     throw new Error('--rest-url is required when --ws-url does not use /v1/smart-alert/stream (or pass --no-backfill)');
   }
@@ -235,6 +237,7 @@ export function buildDaemonCommand(deps = {}) {
     DaemonClass = AlertsDaemon,
     killFn = process.kill.bind(process),
     waitFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    env = process.env,
   } = deps;
 
   return async (args, _apiInstance, flags, options) => {
@@ -271,7 +274,7 @@ export function buildDaemonCommand(deps = {}) {
     const handlers = {
       // ── run ─────────────────────────────────────────────────────────────────
       'run': async () => {
-        const apiKey = getApiKey?.() ?? process.env.NANSEN_API_KEY;
+        const apiKey = getApiKey?.() ?? env.NANSEN_API_KEY;
         if (!apiKey) {
           throw new Error('No API key found. Run: nansen login --api-key <key>');
         }
@@ -334,7 +337,7 @@ export function buildDaemonCommand(deps = {}) {
 
       // ── start ────────────────────────────────────────────────────────────────
       'start': async () => {
-        const apiKey = getApiKey?.() ?? process.env.NANSEN_API_KEY;
+        const apiKey = getApiKey?.() ?? env.NANSEN_API_KEY;
         if (!apiKey) {
           throw new Error('No API key found. Run: nansen login --api-key <key>');
         }
@@ -355,12 +358,14 @@ export function buildDaemonCommand(deps = {}) {
           const pidIdentity = fs.fstatSync(pidFd);
 
           const argv = buildDaemonChildArgv(options, flags, logFile);
+          const childEnv = { ...env };
+          if (!childEnv.NANSEN_API_KEY) childEnv.NANSEN_API_KEY = apiKey;
           let child;
           try {
             child = spawn(process.execPath, argv, {
               detached: true,
               stdio: 'ignore',
-              env: process.env,
+              env: childEnv,
             });
             if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
               // A failed spawn may emit `error` after returning a pid-less child.
@@ -442,6 +447,8 @@ export function buildDaemonCommand(deps = {}) {
           pidFile,
         };
 
+        // Command handlers return domain data; runCLI adds the standard
+        // { success: true, data: status } envelope before writing stdout.
         return status;
       },
 

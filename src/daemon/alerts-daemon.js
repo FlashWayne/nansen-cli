@@ -224,6 +224,7 @@ export class AlertsDaemon extends EventEmitter {
 
       ws.on('open', async () => {
         if (!isCurrent()) return;
+        this._reconnectAttempt = 0;
         this.log('info', `Connected to ${this.wsUrl}`);
         this._startPing();
         this._saveState({ startedAt: this._state.startedAt ?? new Date().toISOString() });
@@ -284,7 +285,6 @@ export class AlertsDaemon extends EventEmitter {
 
     switch (msg.type) {
       case 'connected':
-        this._reconnectAttempt = 0;
         this._saveState({ sessionId: msg.sessionId });
         this.log('info', `Session: ${msg.sessionId}`);
         this.emit('connected', msg);

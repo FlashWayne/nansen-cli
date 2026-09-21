@@ -169,6 +169,25 @@ describe('AlertsDaemon', () => {
     expect(headers).toEqual({ apikey: 'test-key' });
   });
 
+  it('resets reconnect backoff on WebSocket open without waiting for a connected message', async () => {
+    let socket;
+    class OpenOnlyMockWS extends EventEmitter {
+      constructor() {
+        super();
+        socket = this;
+        this.send = vi.fn();
+      }
+    }
+    const { daemon } = makeDaemon({ WebSocket: OpenOnlyMockWS });
+    daemon._reconnectAttempt = 6;
+
+    const connection = daemon._connect();
+    socket.emit('open');
+    expect(daemon._reconnectAttempt).toBe(0);
+    socket.emit('close', 1000, 'done');
+    await connection;
+  });
+
   it('settles a failed connection even when the socket never emits close', async () => {
     let socket;
     class ErrorOnlyMockWS extends EventEmitter {
@@ -748,6 +767,38 @@ describe('daemon command', () => {
   it('refuses to start a background daemon without an API key', async () => {
     const command = buildDaemonCommand({ log: vi.fn(), getApiKey: () => null });
     await expect(command(['start'], null, {}, {})).rejects.toThrow('No API key found');
+  });
+
+  it('passes a config-only API key to the child without mutating the parent env', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-child-env-'));
+    const pidFile = path.join(dir, 'daemon.pid');
+    const parentEnv = { PATH: '/test/bin', NANSEN_BASE_URL: 'https://staging.example' };
+    const child = { pid: 4242, once: vi.fn(), unref: vi.fn() };
+    const spawnFn = vi.fn(() => child);
+    const command = buildDaemonCommand({
+      log: vi.fn(),
+      getApiKey: () => 'config-only-key',
+      spawnFn,
+      env: parentEnv,
+      killFn: vi.fn(),
+      waitFn: vi.fn(async () => {}),
+    });
+
+    try {
+      await command(['start'], null, {}, {
+        'pid-file': pidFile,
+        'log-file': path.join(dir, 'daemon.log'),
+      });
+      const spawnOptions = spawnFn.mock.calls[0][2];
+      expect(spawnOptions.env).toEqual({
+        ...parentEnv,
+        NANSEN_API_KEY: 'config-only-key',
+      });
+      expect(spawnOptions.env).not.toBe(parentEnv);
+      expect(parentEnv).not.toHaveProperty('NANSEN_API_KEY');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('refuses a non-standard WebSocket path without a REST backfill URL', async () => {
