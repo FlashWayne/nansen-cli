@@ -542,7 +542,7 @@ describe('daemon command', () => {
       'action-env': true,
       'no-backfill': true,
       pretty: true,
-    }, '/tmp/daemon.pid', '/tmp/daemon.log');
+    }, '/tmp/daemon.log');
 
     const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
     const packageJson = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8'));
@@ -554,10 +554,50 @@ describe('daemon command', () => {
       '--action', 'handler --mode env',
       '--action-env', '--no-backfill',
       '--state-file', '/tmp/state.json',
-      '--pid-file', '/tmp/daemon.pid',
       '--log-file', '/tmp/daemon.log',
     ]);
+    expect(argv).not.toContain('--pid-file');
     expect(argv).not.toContain('--pretty');
+  });
+
+  it('lets a direct run explicitly own a PID file visible to status', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-run-pid-'));
+    const pidFile = path.join(dir, 'daemon.pid');
+    let resolveStart;
+    let reportStarted;
+    const started = new Promise((resolve) => { reportStarted = resolve; });
+    class FakeDaemon {
+      start() {
+        reportStarted();
+        return new Promise((resolve) => { resolveStart = resolve; });
+      }
+      stop() {}
+    }
+    const killFn = vi.fn((pid) => {
+      if (pid === process.pid) return;
+      throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+    });
+    const command = buildDaemonCommand({
+      getApiKey: () => 'test-key',
+      DaemonClass: FakeDaemon,
+      killFn,
+    });
+
+    try {
+      const running = command(['run'], null, {}, { 'pid-file': pidFile });
+      await started;
+      expect(fs.readFileSync(pidFile, 'utf8')).toBe(String(process.pid));
+      await expect(command(['status'], null, {}, { 'pid-file': pidFile }))
+        .resolves.toMatchObject({ running: true, pid: process.pid });
+
+      resolveStart();
+      await running;
+      expect(fs.existsSync(pidFile)).toBe(false);
+      await expect(command(['status'], null, {}, { 'pid-file': pidFile }))
+        .resolves.toMatchObject({ running: false, pid: null });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
   it('derives backfill safely or requires an explicit REST URL', () => {
     expect(resolveRestUrl(
@@ -712,6 +752,51 @@ describe('daemon command', () => {
       await expect(command(['start'], null, {}, { 'pid-file': pidFile }))
         .rejects.toThrow('lifecycle operation already in progress');
       expect(spawnFn).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('releases its lock by file identity even if lock contents are corrupted', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-lock-corrupt-'));
+    const pidFile = path.join(dir, 'daemon.pid');
+    const lockFile = `${pidFile}.lock`;
+    const child = { pid: 4242, once: vi.fn(), unref: vi.fn() };
+    const command = buildDaemonCommand({
+      log: vi.fn(),
+      getApiKey: () => 'test-key',
+      spawnFn: vi.fn(() => child),
+      killFn: vi.fn(),
+      waitFn: vi.fn(async () => fs.writeFileSync(lockFile, 'corrupted')),
+    });
+
+    try {
+      await command(['start'], null, {}, { 'pid-file': pidFile });
+      expect(fs.existsSync(lockFile)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not remove a replacement lifecycle lock during release', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-lock-replaced-'));
+    const pidFile = path.join(dir, 'daemon.pid');
+    const lockFile = `${pidFile}.lock`;
+    const child = { pid: 4242, once: vi.fn(), unref: vi.fn() };
+    const command = buildDaemonCommand({
+      log: vi.fn(),
+      getApiKey: () => 'test-key',
+      spawnFn: vi.fn(() => child),
+      killFn: vi.fn(),
+      waitFn: vi.fn(async () => {
+        fs.unlinkSync(lockFile);
+        fs.writeFileSync(lockFile, String(process.pid));
+      }),
+    });
+
+    try {
+      await command(['start'], null, {}, { 'pid-file': pidFile });
+      expect(fs.readFileSync(lockFile, 'utf8')).toBe(String(process.pid));
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

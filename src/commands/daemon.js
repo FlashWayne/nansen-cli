@@ -8,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { randomUUID } from 'crypto';
 import { AlertsDaemon } from '../daemon/alerts-daemon.js';
 
 const NANSEN_DIR = path.join(os.homedir(), '.nansen');
@@ -38,7 +39,8 @@ OPTIONS:
   --ws-url <url>          Override WebSocket server URL
   --rest-url <url>        Override REST backfill URL (required for non-standard WS paths)
   --state-file <path>     Path to state JSON (default: ~/.nansen/alerts-daemon-state.json)
-  --pid-file <path>       Path to PID file (default: ~/.nansen/alerts-daemon.pid)
+  --pid-file <path>       Path to PID file. start/stop/status default to
+                          ~/.nansen/alerts-daemon.pid; run owns one only if explicit.
   --log-file <path>       Path to log file (default: ~/.nansen/alerts-daemon.log)
 
 BACKGROUND CONTEXT:
@@ -126,7 +128,7 @@ export function resolveRestUrl(wsUrl, explicitRestUrl, backfill) {
  * parent-command arguments when the CLI is embedded. Authentication, HOME
  * configuration, and NANSEN_BASE_URL are preserved through the inherited env.
  */
-export function buildDaemonChildArgv(options, flags, pidFile, logFile) {
+export function buildDaemonChildArgv(options, flags, logFile) {
   return [
     CLI_ENTRYPOINT,
     'alerts', 'daemon', 'run',
@@ -136,9 +138,35 @@ export function buildDaemonChildArgv(options, flags, pidFile, logFile) {
     ...(flags['action-env'] ? ['--action-env'] : []),
     ...(flags['no-backfill'] ? ['--no-backfill'] : []),
     ...(options['state-file'] ? ['--state-file', options['state-file']] : []),
-    '--pid-file', pidFile,
     '--log-file', logFile,
   ];
+}
+
+function parseLockPid(raw) {
+  try {
+    try {
+      const record = JSON.parse(raw.trim());
+      const pid = Number(typeof record === 'number' ? record : record?.pid);
+      return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+    } catch {
+      const pid = Number(raw.trim()); // compatibility with locks from older releases
+      return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function unlinkIfSameIdentity(file, identity) {
+  try {
+    if (sameFileIdentity(fs.lstatSync(file), identity)) fs.unlinkSync(file);
+  } catch {
+    // Missing/replaced files are not ours to remove.
+  }
 }
 
 function acquireLifecycleLock(pidFile, killFn) {
@@ -148,22 +176,45 @@ function acquireLifecycleLock(pidFile, killFn) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fd = fs.openSync(lockFile, 'wx', 0o600);
+      const identity = fs.fstatSync(fd);
       try {
-        fs.writeFileSync(fd, String(process.pid));
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, token: randomUUID() }));
       } catch (err) {
-        try { fs.unlinkSync(lockFile); } catch { /* best effort */ }
-        throw err;
-      } finally {
+        unlinkIfSameIdentity(lockFile, identity);
         fs.closeSync(fd);
+        throw err;
       }
-      return () => removePidFileIfMatches(lockFile, process.pid);
+      // Keep the descriptor open so its inode cannot be recycled. Cleanup is
+      // based on file identity, not mutable contents: corruption cannot strand
+      // our lock, while a replacement lock at the same path is left untouched.
+      return () => {
+        try {
+          unlinkIfSameIdentity(lockFile, identity);
+        } finally {
+          fs.closeSync(fd);
+        }
+      };
     } catch (err) {
       if (err?.code !== 'EEXIST') throw err;
-      const ownerPid = readPid(lockFile);
-      if (isProcessRunning(ownerPid, killFn)) {
-        throw new Error(`Daemon lifecycle operation already in progress (PID ${ownerPid})`, { cause: err });
+      // Best-effort stale-lock cleanup. The acquired-lock release path above is
+      // stronger because it retains the original descriptor for its lifetime.
+      let staleFd;
+      try {
+        staleFd = fs.openSync(lockFile, 'r');
+        const identity = fs.fstatSync(staleFd);
+        // Read ownership from the opened inode, not from the path. If another
+        // process replaces the path, identity comparison below preserves it.
+        const ownerPid = parseLockPid(fs.readFileSync(staleFd, 'utf8'));
+        if (isProcessRunning(ownerPid, killFn)) {
+          throw new Error(`Daemon lifecycle operation already in progress (PID ${ownerPid})`, { cause: err });
+        }
+        unlinkIfSameIdentity(lockFile, identity);
+      } catch (lockErr) {
+        if (lockErr?.code !== 'ENOENT') throw lockErr;
+        // It disappeared while being inspected; retry acquisition.
+      } finally {
+        if (staleFd !== undefined) fs.closeSync(staleFd);
       }
-      removePidFileIfMatches(lockFile, ownerPid);
     }
   }
   throw new Error('Unable to acquire daemon lifecycle lock');
@@ -182,6 +233,7 @@ export function buildDaemonCommand(deps = {}) {
     log = console.log,
     getApiKey,
     spawnFn,
+    DaemonClass = AlertsDaemon,
     killFn = process.kill.bind(process),
     waitFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   } = deps;
@@ -224,7 +276,7 @@ export function buildDaemonCommand(deps = {}) {
 
         const wsUrl = options['ws-url'];
 
-        const daemon = new AlertsDaemon({
+        const daemon = new DaemonClass({
           apiKey,
           wsUrl,
           restUrl,
@@ -238,8 +290,30 @@ export function buildDaemonCommand(deps = {}) {
           },
         });
 
+        const ownsPidFile = options['pid-file'] !== undefined;
+        if (ownsPidFile) {
+          const releaseLock = acquireLifecycleLock(pidFile, killFn);
+          try {
+            const existingPid = readPid(pidFile);
+            if (isProcessRunning(existingPid, killFn)) {
+              throw new Error(`Daemon already running (PID ${existingPid})`);
+            }
+            removePidFileIfMatches(pidFile, existingPid);
+            const fd = fs.openSync(pidFile, 'wx', 0o600);
+            try {
+              fs.writeFileSync(fd, String(process.pid));
+            } finally {
+              fs.closeSync(fd);
+            }
+          } finally {
+            releaseLock();
+          }
+        }
+
         const shutdown = () => daemon.stop();
-        const cleanupPid = () => removePidFileIfMatches(pidFile, process.pid);
+        const cleanupPid = () => {
+          if (ownsPidFile) removePidFileIfMatches(pidFile, process.pid);
+        };
         process.once('SIGINT', shutdown);
         process.once('SIGTERM', shutdown);
         process.once('exit', cleanupPid);
@@ -249,6 +323,8 @@ export function buildDaemonCommand(deps = {}) {
         } finally {
           process.off('SIGINT', shutdown);
           process.off('SIGTERM', shutdown);
+          process.off('exit', cleanupPid);
+          cleanupPid();
         }
       },
 
@@ -269,7 +345,7 @@ export function buildDaemonCommand(deps = {}) {
 
           // Spawn detached child
           const spawn = spawnFn ?? (await import('child_process')).spawn;
-          const argv = buildDaemonChildArgv(options, flags, pidFile, logFile);
+          const argv = buildDaemonChildArgv(options, flags, logFile);
 
           const child = spawn(process.execPath, argv, {
             detached: true,

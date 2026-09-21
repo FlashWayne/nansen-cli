@@ -54,7 +54,7 @@ missed alerts from the `/past-alerts` REST endpoint.
 | `--ws-url <url>` | Override WebSocket URL (e.g. local mock server) |
 | `--rest-url <url>` | Override REST backfill URL; required when `--ws-url` uses a non-standard path unless `--no-backfill` is set |
 | `--state-file <path>` | State JSON path (default: `~/.nansen/alerts-daemon-state.json`) |
-| `--pid-file <path>` | PID file path (default: `~/.nansen/alerts-daemon.pid`) |
+| `--pid-file <path>` | PID file path. `start`/`stop`/`status` default to `~/.nansen/alerts-daemon.pid`; foreground `run` writes and owns a PID file only when this flag is explicit. |
 | `--log-file <path>` | Log file path (default: `~/.nansen/alerts-daemon.log`) |
 
 ## Examples

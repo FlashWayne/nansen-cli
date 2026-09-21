@@ -2062,6 +2062,10 @@
                   "type": "string",
                   "description": "Path to state JSON (default: ~/.nansen/alerts-daemon-state.json)"
                 },
+                "pid-file": {
+                  "type": "string",
+                  "description": "Optional PID file owned by this foreground process; no PID file is written when omitted"
+                },
                 "log-file": {
                   "type": "string",
                   "description": "Optional path to a log file"
