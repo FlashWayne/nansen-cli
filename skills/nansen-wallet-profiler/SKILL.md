@@ -49,6 +49,17 @@ nansen research profiler historical-balances --address <addr> --chain solana --d
 ```bash
 nansen research profiler related-wallets --address <addr> --chain ethereum
 nansen research profiler counterparties --address <addr> --chain ethereum --days 30
+
+# Counterparties for up to 10 wallets in one call (max --days 90).
+# Results are not aggregated — every row carries the wallet_address it belongs to.
+# One ecosystem per request: EVM and Solana addresses cannot be mixed; `all` auto-detects it.
+# --chain also takes any single chain the profiler serves, EVM or not: arbitrum, arc,
+# avalanche, base, bitcoin, bnb (`bsc` is accepted too), ethereum, hyperevm, injective,
+# iotaevm, linea, mantle, mantra, monad, near, optimism, plasma, polygon, robinhood, sei,
+# solana, sonic, starknet, sui, ton, tron.
+# Rows come back as contiguous per-wallet blocks ordered by wallet address, so a small page
+# holds one wallet only — raise --limit and page with --page N to reach later wallets.
+nansen research profiler counterparties-batch --addresses "0xabc,0xdef" --days 30 --limit 50
 ```
 
 ## Perps (no --chain)
@@ -81,6 +92,7 @@ nansen research profiler compare --addresses "0xabc,0xdef" --chain ethereum
 | `--chain` | Required except for perps and search |
 | `--days` | Lookback period (default 30) |
 | `--limit` | Number of results |
+| `--addresses` | Comma-separated wallets for `batch`, `compare`, `counterparties-batch` |
 | `--include` | Batch fields: `labels,balance,pnl` |
 | `--depth` | Trace depth 1-5 (default 2) |
 | `--width` | Trace width — keep low to save credits |
@@ -92,7 +104,7 @@ nansen research profiler compare --addresses "0xabc,0xdef" --chain ethereum
 
 - `pnl-summary` has no pagination support (returns aggregate stats, not a list).
 - `perp-positions` has no pagination support.
-- `labels` has no pagination support — the API ignores `per_page` and always returns all labels for the address. `--limit` is not available for this sub-command.
+- `labels` supports pagination — `--limit`/`--page` are honoured and the response is `{pagination: {page, per_page, is_last_page}, data[]: {label, category, kind[]}}`.
 - `transactions` caps at per_page=100 (API limit).
 - `trace` makes many API calls — use `--width` conservatively.
 - `batch` accepts `--file <path>` with one address per line as alternative to `--addresses`.

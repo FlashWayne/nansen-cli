@@ -8,22 +8,8 @@
 import crypto from 'crypto';
 import { NansenError, ErrorCode } from './api.js';
 import { wcExec } from './walletconnect-exec.js';
-import { EVM_CHAIN_IDS } from './chain-ids.js';
-
-/**
- * Check if a WalletConnect wallet session is active.
- * Returns { wallet, accounts, expires } or null.
- */
-export async function checkWalletConnection() {
-  try {
-    const output = await wcExec('walletconnect', ['whoami', '--json'], 3000);
-    const data = JSON.parse(output);
-    if (data.connected === false) return null;
-    return data;
-  } catch {
-    return null;
-  }
-}
+import { getWalletConnectAddress } from './walletconnect-trading.js';
+import { evaluatePaymentRequirement, resolvePaymentAmount, resolvePayTo } from './x402-policy.js';
 
 /**
  * Select a compatible payment requirement from the accepts array.
@@ -52,12 +38,34 @@ function parseChainId(network) {
  * Build EIP-712 typed data for TransferWithAuthorization (EIP-3009).
  */
 export function buildEIP712TypedData({ fromAddress, requirement }) {
-  const { asset, payTo, extra, maxTimeoutSeconds } = requirement;
-  // x402 uses "amount", fall back to "maxAmountRequired" for compatibility
-  const amount = requirement.amount || requirement.maxAmountRequired;
+  const payTo = resolvePayTo(requirement);
+  const { asset, maxTimeoutSeconds } = requirement;
+  const extra = requirement.extra || {};
+  const amount = resolvePaymentAmount(requirement);
 
-  // Determine chain ID: extra.chainId > parsed from network > fallback map > base
-  const chainId = extra.chainId || parseChainId(requirement.network) || EVM_CHAIN_IDS[requirement.chain] || EVM_CHAIN_IDS.base;
+  if (!extra.name || !extra.version) {
+    throw new Error(
+      'Refusing to sign x402 payment: EIP-712 domain name/version missing from requirement.extra.',
+    );
+  }
+
+  // Chain id comes only from the CAIP-2 network the policy validated — not from
+  // a remote extra.chainId override, which could change the signing domain.
+  const chainId = parseChainId(requirement.network);
+  if (chainId === null) {
+    throw new Error(
+      `Refusing to sign x402 payment: unsupported or missing EVM network ${requirement.network}.`,
+    );
+  }
+  // A remote extra.chainId that disagrees with the network is a domain-binding
+  // mismatch — refuse rather than sign under either interpretation. A null or
+  // empty extra.chainId means "unspecified", not a conflict, so treat it as absent.
+  if (extra.chainId != null && extra.chainId !== '' && Number(extra.chainId) !== chainId) {
+    throw new Error(
+      `Refusing to sign x402 payment: extra.chainId ${extra.chainId} conflicts with ` +
+      `network ${requirement.network} (chain id ${chainId}).`,
+    );
+  }
 
   const now = Math.floor(Date.now() / 1000);
   const nonce = '0x' + crypto.randomBytes(32).toString('hex');
@@ -121,7 +129,7 @@ export function buildPaymentSignatureHeader({ signature, authorization, resource
  */
 function formatPaymentAmount(requirement) {
   const { extra } = requirement;
-  const rawAmount = requirement.amount || requirement.maxAmountRequired;
+  const rawAmount = resolvePaymentAmount(requirement);
   const symbol = extra.symbol || extra.name || 'tokens';
   const decimals = extra.decimals || 6;
   const amount = Number(rawAmount) / Math.pow(10, decimals);
@@ -138,28 +146,7 @@ function formatPaymentAmount(requirement) {
  * @throws {NansenError} On failure
  */
 export async function handleX402Payment(paymentRequirements) {
-  // 1. Check wallet connection
-  const wallet = await checkWalletConnection();
-  if (!wallet) {
-    throw new NansenError(
-      'x402 payment required but no wallet connected. ' +
-        'To pay automatically: create a local wallet with `nansen wallet create` (then set NANSEN_WALLET_PASSWORD), ' +
-        'or connect an external wallet via the `walletconnect` CLI (`walletconnect connect`).',
-      ErrorCode.PAYMENT_REQUIRED,
-      402
-    );
-  }
-
-  const fromAddress = wallet.accounts[0]?.address;
-  if (!fromAddress) {
-    throw new NansenError(
-      'x402 payment required but wallet has no accounts.',
-      ErrorCode.PAYMENT_REQUIRED,
-      402
-    );
-  }
-
-  // 2. Select compatible payment requirement
+  // 1. Select compatible payment requirement
   const accepts = paymentRequirements.accepts || paymentRequirements;
   const requirement = selectPaymentRequirement(Array.isArray(accepts) ? accepts : [accepts]);
   if (!requirement) {
@@ -171,15 +158,46 @@ export async function handleX402Payment(paymentRequirements) {
     );
   }
 
-  // 3. Build EIP-712 typed data
+  // 2. Evaluate payment policy before touching any signing material
+  const decision = evaluatePaymentRequirement(requirement);
+  if (!decision.ok) {
+    throw new Error(decision.reason);
+  }
+
+  // 3. Resolve the WalletConnect signer scoped to this exact chain. EVM
+  // addresses are identical across chains, so "some account exists in the
+  // session" can't prove the session was actually approved for THIS chain --
+  // only the CAIP-2 chain tag can (mirrors getWalletConnectAddress's chainId
+  // param, used the same way before signing/broadcasting in trading.js and
+  // transfer.js). Without this, a session connected only to, say, Base would
+  // be silently accepted to authorize a payment on BNB Chain or X Layer --
+  // the same defect class fixed in #615, just unguarded here because this
+  // path never reused getWalletConnectAddress and instead took accounts[0]
+  // with no chain filter at all.
+  const chainId = parseChainId(requirement.network);
+  if (chainId === null) {
+    throw new Error(`Refusing to auto-pay: unsupported or missing EVM network ${requirement.network}.`);
+  }
+  const fromAddress = await getWalletConnectAddress('evm', chainId);
+  if (!fromAddress) {
+    throw new NansenError(
+      `x402 payment required but no WalletConnect session is active for chain ${requirement.network}. ` +
+        'To pay automatically: create a local wallet with `nansen wallet create` (then set NANSEN_WALLET_PASSWORD), ' +
+        'or connect an external wallet approved for this chain via the `walletconnect` CLI (`walletconnect connect`).',
+      ErrorCode.PAYMENT_REQUIRED,
+      402
+    );
+  }
+
+  // 4. Build EIP-712 typed data
   const typedData = buildEIP712TypedData({ fromAddress, requirement });
   const typedDataJson = JSON.stringify(typedData);
 
-  // 4. Log payment info to stderr (stdout is for JSON output)
+  // 5. Log payment info to stderr (stdout is for JSON output)
   const amountStr = formatPaymentAmount(requirement);
   process.stderr.write(`x402: Requesting payment approval (${amountStr})...\n`);
 
-  // 5. Sign via walletconnect CLI (120s timeout for user approval)
+  // 6. Sign via walletconnect CLI (120s timeout for user approval)
   let signResult;
   try {
     const output = await wcExec('walletconnect', ['sign-typed-data', typedDataJson], 120000);
@@ -195,11 +213,11 @@ export async function handleX402Payment(paymentRequirements) {
     );
   }
 
-  // 6. Build Payment-Signature header (authorization values must be strings per x402 spec)
+  // 7. Build Payment-Signature header (authorization values must be strings per x402 spec)
   const authorization = {
     from: fromAddress,
-    to: requirement.payTo,
-    value: (requirement.amount || requirement.maxAmountRequired).toString(),
+    to: resolvePayTo(requirement),
+    value: resolvePaymentAmount(requirement).toString(),
     validAfter: typedData.message.validAfter.toString(),
     validBefore: typedData.message.validBefore.toString(),
     nonce: typedData.message.nonce,

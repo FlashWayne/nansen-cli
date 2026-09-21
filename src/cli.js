@@ -4,22 +4,31 @@
  */
 
 import { NansenAPI, NansenError, CommandError, ErrorCode, saveConfig, deleteConfig, getConfigFile, clearCache, getCacheDir, validateAddress, normalizeAddress, sleep } from './api.js';
-import { buildWalletCommands } from './wallet.js';
+import { buildWalletCommands, WALLET_SUBCOMMANDS } from './wallet.js';
+import { buildBridgeCommands, formatBridgeRoutes } from './bridge.js';
+import { buildPerpCommands } from './perp.js';
 import { buildTradingCommands } from './trading.js';
 import { buildLimitOrderCommands } from './limit-order.js';
 import { formatAlertsTable, buildAlertsCommands } from './commands/alerts.js';
 import { buildAgentCommands } from './commands/agent.js';
-import { buildResearchCommands, RESEARCH_HISTORICAL_SUBCOMMANDS } from './commands/research.js';
+import { buildMcpCommands } from './commands/mcp.js';
+import { buildCompletionCommands } from './commands/completion.js';
+import { buildResearchCommands, RESEARCH_HISTORICAL_SUBCOMMANDS, RESEARCH_SUBCOMMANDS } from './commands/research.js';
+import { buildPagination, parseSort, parseCsvOption, rejectBlankOption, parseObjectOption } from './query-options.js';
+export { buildPagination, parseSort };
 import { resolveAddress, isEnsName } from './ens.js';
+import { compareSemver } from './semver.js';
 import fs from 'fs';
 import { getUpdateNotification, getUpgradeNotice, scheduleUpdateCheck } from './update-check.js';
-import { refreshCostMapIfStale, getCostForEndpoint } from './cost-cache.js';
+import { getAuthStatus, runDoctorChecks, runConnectivityChecks, formatDoctorReport } from './doctor.js';
+import { refreshCostMapIfStale, getCostForEndpoint, creditsCharged } from './cost-cache.js';
+import { creditWarning, noticeWarnings } from './response-meta.js';
 import { trackCommandSucceeded, trackCommandFailed } from './telemetry.js';
 import { createRequire } from 'module';
 import * as readline from 'readline';
 
 const require = createRequire(import.meta.url);
-const { version: VERSION } = require('../package.json');
+const { version: VERSION, engines: ENGINES } = require('../package.json');
 
 // ============= Schema Definition =============
 
@@ -40,44 +49,53 @@ export const SCHEMA = { version: VERSION, ...schemaDefinition };
  * Returns true/false/undefined (undefined = not supplied).
  */
 export function resolveBooleanOption(options, flags, key) {
-  if (options[key] !== undefined) {
-    const val = String(options[key]).toLowerCase();
+  const optionValue = options[key];
+  const flagValue = flags[key];
+
+  if (Array.isArray(optionValue) || Array.isArray(flagValue) ||
+      (optionValue !== undefined && flagValue !== undefined)) {
+    throw new NansenError(`--${key} cannot be repeated`, ErrorCode.INVALID_PARAMS);
+  }
+  if (optionValue !== undefined) {
+    const val = String(optionValue).toLowerCase();
     if (val === 'true' || val === '1') return true;
     if (val === 'false' || val === '0') return false;
+    throw new NansenError(`--${key} must be true or false`, ErrorCode.INVALID_PARAMS);
   }
-  if (flags[key] !== undefined) return Boolean(flags[key]);
+  if (flagValue !== undefined) return Boolean(flagValue);
   return undefined;
-}
-
-export function buildPagination(options) {
-  if (!options.limit && !options.page) return undefined;
-  return {
-    page: Math.max(1, parseInt(options.page, 10) || 1),
-    per_page: options.limit,
-  };
 }
 
 // ============= Field Filtering =============
 
 /**
- * Filter object to include only specified fields
- * Supports nested paths with dot notation (e.g., "data.results")
+ * Filter object to include only specified fields.
+ *
+ * A bare name ("address") matches that key at any depth. A dotted path
+ * ("data.results", "results.address") matches only at that position, counted
+ * from the root of the payload; array elements do not add a segment, so
+ * "results.address" selects `address` inside each item of `results`.
  */
 export function filterFields(data, fields) {
   if (!fields || fields.length === 0) return data;
   
-  const fieldSet = new Set(fields);
+  const names = new Set();
+  const paths = new Set();
+  for (const field of fields) {
+    (field.includes('.') ? paths : names).add(field);
+  }
   
-  function filterObject(obj) {
+  function filterObject(obj, path) {
     if (obj === null || obj === undefined) return obj;
     if (Array.isArray(obj)) {
-      return obj.map(item => filterObject(item));
+      return obj.map(item => filterObject(item, path));
     }
     if (typeof obj !== 'object') return obj;
     
     const filtered = {};
     for (const key of Object.keys(obj)) {
-      if (fieldSet.has(key)) {
+      const keyPath = path ? `${path}.${key}` : key;
+      if (names.has(key) || paths.has(keyPath)) {
         // Explicitly requested — include as-is
         filtered[key] = obj[key];
       } else if (typeof obj[key] === 'object' && obj[key] !== null) {
@@ -88,7 +106,7 @@ export function filterFields(data, fields) {
           const hasObjectElements = obj[key].length > 0 &&
             typeof obj[key][0] === 'object' && obj[key][0] !== null;
           if (hasObjectElements) {
-            const nested = obj[key].map(item => filterObject(item))
+            const nested = obj[key].map(item => filterObject(item, keyPath))
               .filter(item => Object.keys(item).length > 0);
             if (nested.length > 0) {
               filtered[key] = nested;
@@ -96,7 +114,7 @@ export function filterFields(data, fields) {
           }
         } else {
           // Plain object — always recurse in case it wraps requested fields
-          const nested = filterObject(obj[key]);
+          const nested = filterObject(obj[key], keyPath);
           if (nested !== null && nested !== undefined && Object.keys(nested).length > 0) {
             filtered[key] = nested;
           }
@@ -106,14 +124,17 @@ export function filterFields(data, fields) {
     return filtered;
   }
   
-  return filterObject(data);
+  return filterObject(data, '');
 }
 
 /**
  * Parse comma-separated fields string
  */
 export function parseFields(fieldsOption) {
-  if (!fieldsOption) return null;
+  if (fieldsOption === undefined || fieldsOption === '') return null;
+  if (typeof fieldsOption !== 'string') {
+    throw new NansenError('--fields must be a comma-separated string', ErrorCode.INVALID_PARAMS);
+  }
   return fieldsOption.split(',').map(f => f.trim()).filter(f => f.length > 0);
 }
 
@@ -163,43 +184,77 @@ export function compactSchema(schema) {
   };
 }
 
-/**
- * Compare two semver strings. Returns 1 if a > b, -1 if a < b, 0 if equal.
- */
-function compareSemver(a, b) {
-  const parse = v => v.replace(/^v/, '').split('.').map(Number);
-  const [aM, am, ap] = parse(a);
-  const [bM, bm, bp] = parse(b);
-  if (aM !== bM) return aM > bM ? 1 : -1;
-  if (am !== bm) return am > bm ? 1 : -1;
-  if (ap !== bp) return ap > bp ? 1 : -1;
-  return 0;
-}
+// Long options that never consume the next argument. The shell-completion
+// generator needs the same list to tell an option's value apart from a
+// subcommand, so it lives here rather than inline in parseArgs.
+export const VALUELESS_FLAGS = new Set([
+  'pretty', 'help', 'version', 'table', 'no-retry', 'cache', 'no-cache', 'stream',
+  'enrich', 'full', 'human', 'enabled', 'disabled', 'expert', 'json', 'offline',
+  'no-simulate', 'no-verify-outcome', 'no-revoke-excessive-allowance', 'dry-run',
+  'send-api-key', 'all', 'max', 'gasless', 'auto-slippage', 'unsafe-no-password',
+  'reveal', 'yes', 'no-backfill', 'action-env',
+]);
 
 export function parseArgs(args) {
   const result = { _: [], flags: {}, options: {} };
+
+  const addFlag = (key) => {
+    if (key in result.flags) {
+      if (!Array.isArray(result.flags[key])) result.flags[key] = [result.flags[key]];
+      result.flags[key].push(true);
+    } else {
+      result.flags[key] = true;
+    }
+  };
   
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     
     if (arg.startsWith('--')) {
-      const key = arg.slice(2);
-      const next = args[i + 1];
+      const equalsIndex = arg.indexOf('=');
+      const inlineKey = equalsIndex === -1 ? null : arg.slice(2, equalsIndex);
+      // `--help=false` is neither help nor a meaningful false value: valueless
+      // switches only accept their bare spelling. Reject it instead of leaking
+      // a stale `flags['help=false']` key that no handler will ever inspect.
+      if (inlineKey !== null && VALUELESS_FLAGS.has(inlineKey)) {
+        throw new NansenError(`--${inlineKey} does not accept a value`, ErrorCode.INVALID_PARAMS);
+      }
+      // Value-taking options, including boolean options handled by
+      // resolveBooleanOption(), accept the conventional `--key=value` spelling.
+      const hasInlineValue = inlineKey !== null;
+      const key = hasInlineValue ? inlineKey : arg.slice(2);
+      const next = hasInlineValue ? arg.slice(equalsIndex + 1) : args[i + 1];
       
-      if (key === 'pretty' || key === 'help' || key === 'version' || key === 'table' || key === 'no-retry' || key === 'cache' || key === 'no-cache' || key === 'stream' || key === 'enrich' || key === 'full' || key === 'human' || key === 'enabled' || key === 'disabled' || key === 'expert' || key === 'json' || key === 'no-backfill' || key === 'action-env') {
+      if (VALUELESS_FLAGS.has(key)) {
+        // Repeating a switch is idempotent. Keeping the value strictly true
+        // avoids leaking `[true, true]` into consumers that use `=== true`.
         result.flags[key] = true;
-      } else if (next && (!next.startsWith('-') || /^-\d/.test(next))) {
-        // Try to parse as JSON first (for objects/arrays/booleans),
-        // but keep numeric strings as strings to avoid precision loss
-        // and scientific notation for large integers (e.g. 1e+21).
-        let parsedValue;
+      // `next !== undefined` rather than a truthiness check: an explicit empty
+      // string is a real value, and skipping it here left `""` dangling to be
+      // picked up as a positional arg on the next iteration.
+      // An inline value was explicitly supplied and is always consumed, even
+      // when it begins with a dash; downstream option validation owns whether
+      // that value is meaningful. The dash guard applies only to two-token
+      // input, where `--key --next` denotes two separate arguments.
+      } else if (hasInlineValue || (next !== undefined && (!next.startsWith('-') || /^-\d/.test(next)))) {
+        // Try to parse as JSON so object/array options (`--filters '{}'`,
+        // `--order-by '[...]'`) arrive structured. Numbers stay strings to
+        // avoid precision loss and scientific notation for large integers
+        // (e.g. 1e+21). The bare keywords true/false/null stay strings too:
+        // no option takes a boolean or null *value*, so coercing them would
+        // silently retype a string option (`--sort true` used to become the
+        // boolean true). Boolean options read the strings 'true'/'false'
+        // through resolveBooleanOption().
+        let parsedValue = next;
         try {
           const parsed = JSON.parse(next);
-          parsedValue = typeof parsed === 'number' ? next : parsed;
+          if (typeof parsed !== 'number' && typeof parsed !== 'boolean' && parsed !== null) {
+            parsedValue = parsed;
+          }
         } catch {
-          parsedValue = next;
+          // Not JSON: keep the raw string.
         }
-        i++;
+        if (!hasInlineValue) i++;
         // Accumulate repeated options into arrays (supports repeatable flags like --token, --subject)
         if (key in result.options) {
           if (!Array.isArray(result.options[key])) {
@@ -210,10 +265,10 @@ export function parseArgs(args) {
           result.options[key] = parsedValue;
         }
       } else {
-        result.flags[key] = true;
+        addFlag(key);
       }
     } else if (arg.startsWith('-')) {
-      result.flags[arg.slice(1)] = true;
+      addFlag(arg.slice(1));
     } else {
       result._.push(arg);
     }
@@ -222,12 +277,134 @@ export function parseArgs(args) {
   return result;
 }
 
+function parseSafeIntegerOption(
+  name,
+  options,
+  flags,
+  defaultValue,
+  requirement = 'safe integer',
+) {
+  if (flags[name]) {
+    throw new NansenError(
+      `--${name} requires a ${requirement} value`,
+      ErrorCode.INVALID_PARAMS,
+    );
+  }
+
+  if (options[name] === undefined) return defaultValue;
+
+  const rawValue = options[name];
+
+  if (Array.isArray(rawValue)) {
+    throw new NansenError(
+      `--${name} may only be specified once`,
+      ErrorCode.INVALID_PARAMS,
+    );
+  }
+
+  if (
+    typeof rawValue === 'boolean' ||
+    (typeof rawValue === 'string' && rawValue.trim() === '')
+  ) {
+    throw new NansenError(
+      `--${name} requires a ${requirement} value`,
+      ErrorCode.INVALID_PARAMS,
+    );
+  }
+
+  const value =
+    typeof rawValue === 'string' || typeof rawValue === 'number'
+      ? Number(rawValue)
+      : NaN;
+
+  if (!Number.isSafeInteger(value)) {
+    throw new NansenError(
+      `--${name} must be a ${requirement}; received: ${String(rawValue)}`,
+      ErrorCode.INVALID_PARAMS,
+    );
+  }
+
+  return value;
+}
+
+function parseFiniteNumberOption(name, options, flags) {
+  if (flags[name]) {
+    throw new NansenError(
+      `--${name} requires a finite number`,
+      ErrorCode.INVALID_PARAMS,
+    );
+  }
+  if (options[name] === undefined) return undefined;
+
+  const rawValue = options[name];
+  if (Array.isArray(rawValue)) {
+    throw new NansenError(
+      `--${name} may only be specified once`,
+      ErrorCode.INVALID_PARAMS,
+    );
+  }
+  if (typeof rawValue === 'string' && rawValue.trim() === '') {
+    throw new NansenError(
+      `--${name} requires a finite number`,
+      ErrorCode.INVALID_PARAMS,
+    );
+  }
+  const value = typeof rawValue === 'string' || typeof rawValue === 'number'
+    ? Number(rawValue)
+    : NaN;
+  if (!Number.isFinite(value)) {
+    throw new NansenError(
+      `--${name} must be a finite number; received: ${String(rawValue)}`,
+      ErrorCode.INVALID_PARAMS,
+    );
+  }
+  return value;
+}
+
+function parseNonNegativeSafeIntegerOption(name, options, flags, defaultValue) {
+  const value = parseSafeIntegerOption(
+    name,
+    options,
+    flags,
+    defaultValue,
+    'non-negative safe integer',
+  );
+
+  if (value < 0) {
+    throw new NansenError(
+      `--${name} must be a non-negative safe integer; received: ${value}`,
+      ErrorCode.INVALID_PARAMS,
+    );
+  }
+
+  return value;
+}
+
+
+function parseDaysOption(options, flags) {
+  const days = parseNonNegativeSafeIntegerOption('days', options, flags, 30);
+  // Safe integers can still exceed JavaScript Date's representable range.
+  // Anchor the overflow check to the Unix epoch so the boundary is deterministic.
+  const fromMs = 0 - days * 24 * 60 * 60 * 1000;
+  if (Number.isNaN(new Date(fromMs).getTime())) {
+    throw new NansenError(
+      `--days is outside the supported date range; received: ${days}`,
+      ErrorCode.INVALID_PARAMS,
+    );
+  }
+  return days;
+}
+
 // Format a single value for table display
 export function formatValue(val) {
   if (val === null || val === undefined) return '';
   if (typeof val === 'number') {
     if (Math.abs(val) >= 1000000) return (val / 1000000).toFixed(2) + 'M';
-    if (Math.abs(val) >= 1000) return (val / 1000).toFixed(2) + 'K';
+    if (Math.abs(val) >= 1000) {
+      const formatted = (val / 1000).toFixed(2);
+      if (Math.abs(parseFloat(formatted)) >= 1000) return (val / 1000000).toFixed(2) + 'M';
+      return formatted + 'K';
+    }
     if (Number.isInteger(val)) return val.toString();
     return val.toFixed(2);
   }
@@ -257,7 +434,7 @@ export function formatTable(data) {
   }
 
   // Get columns from first record, prioritize common useful fields
-  const priorityFields = ['token_symbol', 'token_name', 'symbol', 'name', 'address', 'label', 'chain', 'value_usd', 'amount', 'pnl_usd', 'price_usd', 'volume_usd', 'net_flow_usd', 'timestamp', 'block_timestamp'];
+  const priorityFields = ['token_symbol', 'token_name', 'symbol', 'name', 'wallet_address', 'address', 'label', 'chain', 'value_usd', 'amount', 'pnl_usd', 'price_usd', 'volume_usd', 'net_flow_usd', 'timestamp', 'block_timestamp'];
   const allKeys = [...new Set(records.flatMap(r => Object.keys(r)))];
 
   // Sort: priority fields first, then alphabetically
@@ -343,26 +520,52 @@ export function formatCsv(data) {
   return lines.join('\n');
 }
 
+// Render the error envelope for the non-JSON formats. CSV gets a real header
+// row plus one record so the envelope stays machine-parseable; table keeps the
+// leading `Error:` line and follows it with one `key: value` line per field, so
+// code, status and details are not dropped on the way to the terminal.
+function formatErrorText(data, { csv = false } = {}) {
+  if (csv) return formatCsv(data);
+  const lines = [`Error: ${data.error}`];
+  for (const [key, val] of Object.entries(data)) {
+    if (key === 'success' || key === 'error' || val == null) continue;
+    lines.push(`${key}: ${typeof val === 'object' ? JSON.stringify(val) : val}`);
+  }
+  return lines.join('\n');
+}
+
 // Format output data (returns string, does not print)
 export function formatOutput(data, { pretty = false, table = false, csv = false } = {}) {
-  if (csv) {
+  if (csv || table) {
     if (data.success === false) {
-      return { type: 'error', text: `Error: ${data.error}` };
+      return { type: 'error', text: formatErrorText(data, { csv }) };
     }
-    const csvData = data.data || data;
-    return { type: 'csv', text: formatCsv(csvData) };
-  } else if (table) {
-    if (data.success === false) {
-      return { type: 'error', text: `Error: ${data.error}` };
-    } else {
-      const tableData = data.data || data;
-      return { type: 'table', text: formatTable(tableData) };
-    }
+    const body = data.data || data;
+    return csv
+      ? { type: 'csv', text: formatCsv(body) }
+      : { type: 'table', text: formatTable(body) };
   } else if (pretty) {
     return { type: 'json', text: JSON.stringify(data, null, 2) };
   } else {
     return { type: 'json', text: JSON.stringify(data) };
   }
+}
+
+// Codes whose message is a usage banner written for a human to read: multi-line,
+// indented, with a blank line between sections. Serialising one into the error
+// envelope turns every newline into a literal \n and makes it unreadable, so an
+// interactive terminal gets the message as written instead. Piped or explicitly
+// formatted output still gets the envelope, so agents keep one shape to branch on.
+export const USAGE_ERROR_CODES = new Set(['MISSING_PARAM', 'MISSING_ARGS']);
+
+export function isUsageError(errorData, { pretty, table, csv, stream, isTTY }) {
+  if (!USAGE_ERROR_CODES.has(errorData.code)) return false;
+  // API errors can map onto the same semantic code (for example the server's
+  // `missing_field` becomes MISSING_PARAM), but they are not local usage
+  // banners and must retain the structured envelope in every output mode.
+  if (errorData.status != null) return false;
+  if (pretty || table || csv || stream) return false;
+  return !!isTTY;
 }
 
 // Format error data (returns object, does not exit)
@@ -374,6 +577,10 @@ export function formatError(error) {
     code: error.code || 'UNKNOWN',
     status: error.status || null,
   };
+  // Hoisted so the id survives even if details is omitted or later pruned.
+  if (details?.requestId) {
+    result.requestId = details.requestId;
+  }
   if (details != null && !(typeof details === 'object' && !Array.isArray(details) && Object.keys(details).length === 0)) {
     result.details = details;
   }
@@ -415,39 +622,51 @@ export function formatStream(data) {
  *          or already-parsed object {from, to}.
  * Falls back to days-based range if no date provided.
  */
-export function parseDateOption(dateOption, days = 30) {
-  if (dateOption) {
-    if (typeof dateOption === 'object' && dateOption.from) {
-      return dateOption;
-    }
-    if (typeof dateOption === 'string') {
-      // Simple date string: use as both from and to
-      const dateMatch = dateOption.match(/^\d{4}-\d{2}-\d{2}$/);
-      if (dateMatch) {
-        return { from: dateOption, to: dateOption };
-      }
-    }
-  }
-  // Default: use days-based range
-  const to = new Date().toISOString().split('T')[0];
-  const from = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-  return { from, to };
+function isValidDateOnly(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
-// Parse simple sort syntax: "field:direction" or "field" (defaults to DESC)
-export function parseSort(sortOption, orderByOption) {
-  // If --order-by is provided, use it (full JSON control)
-  if (orderByOption) return orderByOption;
-  
-  // If no --sort, return undefined
-  if (!sortOption) return undefined;
-  
-  // Parse --sort field:direction or --sort field
-  const parts = sortOption.split(':');
-  const field = parts[0];
-  const direction = (parts[1] || 'desc').toUpperCase();
-  
-  return [{ field, direction }];
+export function parseDateOption(dateOption, days = 30, valuelessDateFlag = false) {
+  if (valuelessDateFlag) {
+    throw new NansenError(
+      '--date requires a value in YYYY-MM-DD format or a JSON date range',
+      ErrorCode.INVALID_PARAMS,
+    );
+  }
+
+  if (dateOption === undefined) {
+    // Default: use days-based range only when --date was not supplied.
+    const to = new Date().toISOString().split('T')[0];
+    const from = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    return { from, to };
+  }
+
+  let parsedOption = dateOption;
+  if (typeof parsedOption === 'string' && !isValidDateOnly(parsedOption)) {
+    try {
+      parsedOption = JSON.parse(parsedOption);
+    } catch {
+      // Keep the original value so the actionable validation error below is used.
+    }
+  }
+
+  if (typeof parsedOption === 'string' && isValidDateOnly(parsedOption)) {
+    return { from: parsedOption, to: parsedOption };
+  }
+
+  if (parsedOption && typeof parsedOption === 'object' && !Array.isArray(parsedOption)) {
+    const { from, to } = parsedOption;
+    if (isValidDateOnly(from) && (to === undefined || isValidDateOnly(to))) {
+      return { from, to: to ?? from };
+    }
+  }
+
+  throw new NansenError(
+    '--date must be YYYY-MM-DD or a JSON object with a valid "from" date and optional "to" date',
+    ErrorCode.INVALID_PARAMS,
+  );
 }
 
 // Enrich transfers with Nansen labels for from/to addresses
@@ -468,7 +687,9 @@ async function enrichTransfers(result, apiInstance, chain) {
   for (const addr of addrs) {
     try {
       const labelsResult = await apiInstance.addressLabels({ address: addr, chain });
-      labelMap[addr] = labelsResult?.labels || labelsResult?.data?.results || [];
+      labelMap[addr] = Array.isArray(labelsResult?.data)
+        ? labelsResult.data.map(item => item.label)
+        : labelsResult?.labels || [];
     } catch {
       labelMap[addr] = [];
     }
@@ -514,6 +735,35 @@ export function parseAddressList(raw) {
   }
 }
 
+/**
+ * Read an address list from a file: either a JSON array of address strings or
+ * one address per line. Shared by the profiler commands that accept --file.
+ */
+function readAddressFile(file) {
+  let content;
+  try {
+    content = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    throw new NansenError(
+      `Could not read --file ${file}: ${err.code === 'ENOENT' ? 'no such file' : err.message}`,
+      ErrorCode.INVALID_PARAMS
+    );
+  }
+  try {
+    const parsed = JSON.parse(content);
+    if (!Array.isArray(parsed) || !parsed.every(item => typeof item === 'string')) {
+      throw new NansenError(
+        'File must contain a JSON array of address strings or one address per line',
+        ErrorCode.INVALID_PARAMS
+      );
+    }
+    return parsed.map(a => a.trim()).filter(Boolean);
+  } catch (e) {
+    if (e instanceof NansenError) throw e;
+    return content.split('\n').map(a => a.trim()).filter(Boolean);
+  }
+}
+
 // ============= Composite Functions =============
 
 export async function batchProfile(api, params = {}) {
@@ -547,7 +797,10 @@ export async function batchProfile(api, params = {}) {
     }
     try {
       if (include.includes('labels')) {
-        entry.labels = await api.addressLabels({ address, chain });
+        const labelsResult = await api.addressLabels({ address, chain });
+        entry.labels = Array.isArray(labelsResult?.data)
+          ? labelsResult.data
+          : labelsResult?.labels || [];
       }
       if (include.includes('balance')) {
         entry.balance = await api.addressBalance({ address, chain });
@@ -562,6 +815,17 @@ export async function batchProfile(api, params = {}) {
     if (i < addresses.length - 1) await sleep(delayMs);
   }
   return { results, total: addresses.length, completed: results.filter(r => !r.error).length };
+}
+
+function normalizeTraceDepth(raw) {
+  const value = parseSafeIntegerOption(
+    'depth',
+    { depth: raw },
+    {},
+    2,
+  );
+
+  return Math.max(1, Math.min(value, 5));
 }
 
 export async function traceCounterparties(api, params = {}) {
@@ -584,7 +848,7 @@ export async function traceCounterparties(api, params = {}) {
   if (!validation.valid) {
     throw new NansenError(validation.error, ErrorCode.INVALID_ADDRESS);
   }
-  const clampedDepth = Math.max(1, Math.min(depth, 5));
+  const clampedDepth = normalizeTraceDepth(depth);
   const visited = new Set();
   const nodes = [];
   const edges = [];
@@ -649,47 +913,102 @@ export async function compareWallets(api, params = {}) {
     }
   }
 
-  // Fetch counterparties and balances for both addresses
+  // Fetch counterparties and balances for both addresses. A failed request is
+  // recorded rather than treated as an empty result, so an auth or rate-limit
+  // error cannot masquerade as "no overlap" / "0 USD".
+  const settle = (promise) => promise.then(value => ({ value }), error => ({ error }));
   const [cp1, cp2] = await Promise.all([
-    api.addressCounterparties({ address: addr1, chain, days }).catch(() => null),
-    api.addressCounterparties({ address: addr2, chain, days }).catch(() => null),
+    settle(api.addressCounterparties({ address: addr1, chain, days })),
+    settle(api.addressCounterparties({ address: addr2, chain, days })),
   ]);
   await sleep(delayMs);
   const [bal1, bal2] = await Promise.all([
-    api.addressBalance({ address: addr1, chain }).catch(() => null),
-    api.addressBalance({ address: addr2, chain }).catch(() => null),
+    settle(api.addressBalance({ address: addr1, chain })),
+    settle(api.addressBalance({ address: addr2, chain })),
   ]);
+
+  const outcomes = [
+    [addr1, 'counterparties', cp1], [addr2, 'counterparties', cp2],
+    [addr1, 'balance', bal1], [addr2, 'balance', bal2],
+  ];
+  const errors = [];
+  const failures = [];
+  for (const [address, source, outcome] of outcomes) {
+    if (outcome.error) {
+      failures.push(outcome.error);
+      errors.push({ address, source, code: outcome.error.code ?? 'UNKNOWN', message: outcome.error.message });
+    }
+  }
+  if (failures.length === outcomes.length) {
+    throw failures[0];
+  }
 
   // Extract counterparty addresses
   const extractCps = (result) => {
     const list = result?.data?.results || result?.counterparties || result?.data || [];
     return Array.isArray(list) ? list : [];
   };
-  const cps1 = extractCps(cp1);
-  const cps2 = extractCps(cp2);
-  const cpAddrs1 = new Set(cps1.map(c => c.counterparty_address || c.address || c.counterparty).filter(Boolean));
-  const cpAddrs2 = new Set(cps2.map(c => c.counterparty_address || c.address || c.counterparty).filter(Boolean));
-  const sharedCpAddrs = [...cpAddrs1].filter(a => cpAddrs2.has(a));
+  let sharedCpAddrs = null;
+  if (!cp1.error && !cp2.error) {
+    const cpAddrs1 = new Set(extractCps(cp1.value).map(c => c.counterparty_address || c.address || c.counterparty).filter(Boolean));
+    const cpAddrs2 = new Set(extractCps(cp2.value).map(c => c.counterparty_address || c.address || c.counterparty).filter(Boolean));
+    sharedCpAddrs = [...cpAddrs1].filter(a => cpAddrs2.has(a));
+  }
 
   // Extract token holdings
   const extractTokens = (result) => {
     const list = result?.data?.results || result?.balances || result?.data || [];
     return Array.isArray(list) ? list : [];
   };
-  const tokens1 = extractTokens(bal1);
-  const tokens2 = extractTokens(bal2);
-  const tokenSyms1 = new Set(tokens1.map(t => t.token_symbol).filter(Boolean));
-  const tokenSyms2 = new Set(tokens2.map(t => t.token_symbol).filter(Boolean));
-  const sharedTokens = [...tokenSyms1].filter(s => tokenSyms2.has(s));
+  const tokens1 = bal1.error ? null : extractTokens(bal1.value);
+  const tokens2 = bal2.error ? null : extractTokens(bal2.value);
+  let sharedTokens = null;
+  if (tokens1 && tokens2) {
+    // Two different contracts can share a symbol, so when both sides report a
+    // token address the address decides. When either side has no address for
+    // a token (some responses omit it for the native asset) the symbol is the
+    // only identity available and is used instead.
+    const addressOf = (t) => {
+      const address = t.token_address || t.mint || t.address;
+      return address ? String(address).toLowerCase() : null;
+    };
+    const symbolOf = (t) => (t.token_symbol ? String(t.token_symbol).toLowerCase() : null);
+    const addresses2 = new Set(tokens2.map(addressOf).filter(Boolean));
+    const symbols2 = new Set(tokens2.map(symbolOf).filter(Boolean));
+    const symbolsWithoutAddress2 = new Set(
+      tokens2.filter(t => !addressOf(t)).map(symbolOf).filter(Boolean)
+    );
+    const seen = new Set();
+    sharedTokens = [];
+    for (const t of tokens1) {
+      const address = addressOf(t);
+      const symbol = symbolOf(t);
+      // With an address on both sides only the address counts. If either
+      // side omits it (as some responses do for the native asset) a matching
+      // symbol is taken as the same token.
+      const matched = address
+        ? addresses2.has(address) || (symbol && symbolsWithoutAddress2.has(symbol))
+        : symbol && symbols2.has(symbol);
+      const key = address || symbol;
+      if (matched && !seen.has(key)) {
+        seen.add(key);
+        sharedTokens.push(t.token_symbol || address);
+      }
+    }
+  }
+  const totalUsd = (tokens) => tokens === null
+    ? null
+    : tokens.reduce((sum, t) => sum + (t.value_usd ?? t.balance_usd ?? 0), 0);
 
   return {
     addresses: [addr1, addr2], chain,
     shared_counterparties: sharedCpAddrs,
     shared_tokens: sharedTokens,
     balances: [
-      { address: addr1, total_usd: tokens1.reduce((sum, t) => sum + (t.value_usd ?? t.balance_usd ?? 0), 0) },
-      { address: addr2, total_usd: tokens2.reduce((sum, t) => sum + (t.value_usd ?? t.balance_usd ?? 0), 0) },
+      { address: addr1, total_usd: totalUsd(tokens1) },
+      { address: addr2, total_usd: totalUsd(tokens2) },
     ],
+    ...(errors.length > 0 && { incomplete: true, errors }),
   };
 }
 
@@ -701,15 +1020,21 @@ USAGE: nansen <command> [subcommand] [options]
 
 COMMANDS:
   trade       DEX swaps/bridges: quote, execute, bridge-status, limit-order
-  research    analytics: smart-money, profiler, token, search, perp, portfolio, points
-  wallet      create, list, show, export, default, delete, forget-password
+  bridge      Hyperliquid bridge: quote, execute, status (EVM <-> HL)
+  perp        Hyperliquid perps: order, cancel, close, leverage, transfer, approve-builder-fee, positions, orders, account, meta, screener, leaderboard
+  research    analytics: smart-money, profiler, token, search, perp, portfolio
+  wallet      ${WALLET_SUBCOMMANDS.join(', ')}
   agent       Ask the Nansen AI research agent (fast/expert modes)
-  alerts      list, create, update, toggle, delete
+  alerts      list, create, update, toggle, delete, daemon
   web         search, fetch
+  mcp         install/uninstall/verify the Nansen MCP server
   account     Show API key status, plan, and remaining credits
-  login       Save API key (--api-key <key>, --human, or NANSEN_API_KEY env var)
+  auth        status — offline auth status: key source, wallets (no network)
+  login       Save API key (--human, NANSEN_API_KEY, or --api-key <key>)
   logout      Remove saved API key
+  doctor      Diagnostics: auth, wallets, caches, connectivity (--offline --json)
   schema      JSON schema for all commands (use "nansen schema <cmd>" for one)
+  completion  Shell completions: bash, zsh, fish
   cache       clear
   changelog   --since <version> to filter
 
@@ -724,6 +1049,12 @@ TRADING:
   nansen trade limit-order create --from SOL --to USDC --amount 1.5 --trigger-mint SOL --trigger-condition below --trigger-price 80
   Supports Solana/Base DEX swaps, cross-chain bridges, and Solana limit orders.
 
+BRIDGE (Hyperliquid):
+  nansen bridge quote --from-chain base --to-chain hyperliquid --from-token USDC --amount 1000000
+  nansen bridge execute --quote <quoteId>
+  nansen bridge status --request-id <id>
+  Supports EVM chains (ethereum, base, arbitrum, polygon, bnb) <-> Hyperliquid.
+
 EXAMPLES:
   nansen trade quote --chain base --from ETH --to USDC --amount 1000000000000000000
   nansen trade quote --chain base --to-chain solana --from USDC --to USDC --amount 1000000
@@ -732,56 +1063,111 @@ EXAMPLES:
   nansen research profiler balance --address 0x... --chain ethereum
 
 DEPRECATED ALIASES (still work, will be removed in a future version):
-  smart-money, profiler, token, search, perp, portfolio, points → use "nansen research <command>"
+  smart-money, profiler, token, search, portfolio → use "nansen research <command>"
   quote, execute → use "nansen trade <command>"
 
-Research chains: ethereum, solana, base, bnb, arbitrum, polygon, optimism, avalanche, linea, scroll, mantle, ronin, sei, plasma, sonic, monad, hyperevm, iotaevm
+Research chains: ${SCHEMA.chains.join(', ')}
 Trade chains: solana, base
+Bridge chains: ethereum, base, arbitrum, polygon, bnb, hyperliquid
 Labels: Fund, Smart Trader, 30D/90D/180D Smart Trader, Smart HL Perps Trader
 
 Docs: https://docs.nansen.ai
 Skills: npx skills add nansen-ai/nansen-cli (agent-optimised docs per command group)
 
-Telemetry: anonymous usage stats collected. Disable: DO_NOT_TRACK=1
+Telemetry: anonymous usage stats (commands, timing, errors). Perp order/close additionally send each leg's side, outcome, order id, shared submission id, and a SHA-256 wallet identifier. Raw wallet, price, size, and exchange error text are not sent. Disable: DO_NOT_TRACK=1
 `;
 
-// Helper to prompt for input (exported for mocking)
-export async function prompt(question, hidden = false) {
+// Usage text for the `trade` command group. Shared by the trade handler and the
+// --help path in runCLI, so `nansen trade`, `nansen trade <sub> --help`, and the
+// deprecated top-level `quote`/`execute --help` all show the same usage.
+export const TRADE_USAGE = `nansen trade — DEX trading commands
+
+SUBCOMMANDS:
+  quote          Get a swap quote (price, route, fees)
+  execute        Sign and broadcast a quoted swap
+  bridge-status  Check cross-chain bridge transaction status
+  limit-order    Limit order management (Solana only)
+
+USAGE:
+  nansen trade quote --chain <chain> --from <token> --to <token> --amount <units> [--wallet <name>]
+  nansen trade quote --chain <chain> --to-chain <chain> --from <token> --to <token> --amount <units>
+  nansen trade execute --quote <quoteId> [--wallet <name>] [--dry-run] [--yes]
+  nansen trade bridge-status --tx-hash <hash> --from-chain <chain> --to-chain <chain>
+  nansen trade limit-order <create|list|cancel|update> [options]
+
+EXAMPLES:
+  nansen trade quote --chain solana --from SOL --to USDC --amount 1000000000
+  nansen trade quote --chain base --from ETH --to USDC --amount 1000000000000000000
+  nansen trade quote --chain base --to-chain solana --from USDC --to USDC --amount 1000000
+  nansen trade execute --quote 1708900000000-abc123
+  nansen trade bridge-status --tx-hash 0xabc... --from-chain base --to-chain solana
+  nansen trade limit-order create --from SOL --to USDC --amount 1.5 --trigger-mint SOL --trigger-condition below --trigger-price 80
+  nansen trade limit-order list
+
+WALLET:
+  --wallet <name>   Use a named wallet, or "walletconnect" / "wc" for WalletConnect.
+                    Defaults to the default local wallet if omitted.
+
+BEFORE BROADCASTING (execute only):
+  --dry-run         Validate and print what would be sent, then stop. Nothing is
+                    signed or broadcast and the quote stays usable. Exits 0.
+  --yes, -y         Skip the confirmation prompt (same as NANSEN_YES=1). The prompt
+                    only appears when stdin is a terminal — agents, CI and pipes run
+                    unprompted either way. Declining exits 1 with nothing signed.
+
+SYMBOLS:
+  Common tokens resolve automatically: SOL, ETH, USDC, USDT, WETH
+  Raw addresses are also accepted.
+
+CROSS-CHAIN NOTES (when using --to-chain):
+  Supported combos:
+    native → native (ETH <-> SOL)
+    USDC → USDC (both directions)
+    USDC → native (USDC → ETH or SOL)
+    native → USDC (ETH/SOL → USDC)
+    non-native → non-native — not supported (use USDC as intermediate)
+  Bridge providers: Li.Fi or Relay (selected automatically based on best price)
+  Typical bridge time: 1-5 minutes`;
+
+// Helper to prompt for input (exported for mocking). Output defaults to stderr
+// so the prompt and masked `*` characters stay on the terminal and never land
+// in a redirected stdout (matching wallet.js promptPassword).
+export async function prompt(question, hidden = false, { input = process.stdin, output = process.stderr } = {}) {
   return new Promise((resolve) => {
-    if (hidden && process.stdout.isTTY) {
-      process.stdout.write(question);
-      let input = '';
-      process.stdin.setRawMode(true);
-      process.stdin.resume();
-      process.stdin.setEncoding('utf8');
+    if (hidden && input.isTTY) {
+      output.write(question);
+      let value = '';
+      input.setRawMode(true);
+      input.resume();
+      input.setEncoding('utf8');
       
       const onData = (char) => {
         if (char === '\n' || char === '\r') {
-          process.stdin.setRawMode(false);
-          process.stdin.pause();
-          process.stdin.removeListener('data', onData);
-          process.stdout.write('\n');
-          resolve(input);
+          input.setRawMode(false);
+          input.pause();
+          input.removeListener('data', onData);
+          output.write('\n');
+          resolve(value);
         } else if (char === '\u0003') {
           // Ctrl+C
           process.exit();
         } else if (char === '\u007F' || char === '\b') {
           // Backspace
-          if (input.length > 0) {
-            input = input.slice(0, -1);
-            process.stdout.write('\b \b');
+          if (value.length > 0) {
+            value = value.slice(0, -1);
+            output.write('\b \b');
           }
         } else {
-          input += char;
-          process.stdout.write('*');
+          value += char;
+          output.write('*');
         }
       };
       
-      process.stdin.on('data', onData);
+      input.on('data', onData);
     } else {
       const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout
+        input,
+        output
       });
       rl.question(question, (answer) => {
         rl.close();
@@ -791,25 +1177,83 @@ export async function prompt(question, hidden = false) {
   });
 }
 
+// Confirmation prompts belong to the CLI adapter rather than trade/bridge
+// core. EOF and Ctrl+C resolve as the safe default ("no") so a closed input
+// cannot leave an irreversible command hanging forever.
+export async function promptForConfirmation(question, { input = process.stdin, output = process.stderr } = {}) {
+  const rl = readline.createInterface({ input, output });
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (answer) => {
+      if (settled) return;
+      settled = true;
+      rl.close();
+      resolve(answer);
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      rl.close();
+      reject(error);
+    };
+
+    rl.once('close', () => finish(''));
+    rl.once('SIGINT', () => finish(''));
+    rl.once('error', fail);
+    rl.question(question, finish);
+  });
+}
+
 // Build command handlers (returns object with handler functions)
 export function buildCommands(deps = {}) {
   // Allow dependency injection for testing
   const {
     api: _api = null,
+    // Password/API-key input belongs to login and may be hidden. Confirmation
+    // is a separate contract: callers must opt into it explicitly so this
+    // prompt can never be reused for an irreversible yes/no decision.
     promptFn = prompt,
+    confirmationPromptFn,
     log = console.log,
     errorOutput: _errorOutput = console.error,
     NansenAPIClass: _NansenAPIClass = NansenAPI,
     saveConfigFn = saveConfig,
     deleteConfigFn = deleteConfig,
     getConfigFileFn = getConfigFile,
-    isTTY = process.stdin.isTTY
+    isTTY = process.stdin.isTTY,
+    env = process.env
   } = deps;
 
   const cmds = {
     'account': async (_args, apiInstance, _flags, _options) => {
       return apiInstance.getAccount();
     },
+
+    'auth': async (args, _apiInstance, _flags, _options) => {
+      const subcommand = args[0] || 'status';
+      if (subcommand !== 'status') {
+        throw new NansenError(`Unknown auth subcommand: ${subcommand}. Available: status`, ErrorCode.UNKNOWN);
+      }
+      return getAuthStatus();
+    },
+
+    'doctor': async (_args, _apiInstance, flags, _options) => {
+      const checks = runDoctorChecks({ cliVersion: VERSION, engines: ENGINES });
+      if (!flags.offline) {
+        checks.push(...await runConnectivityChecks());
+      }
+      if (flags.json) {
+        return {
+          version: VERSION,
+          offline: Boolean(flags.offline),
+          checks,
+          errors: checks.filter(c => c.status === 'error').length,
+          warnings: checks.filter(c => c.status === 'warn').length,
+        };
+      }
+      log(formatDoctorReport(checks, { cliVersion: VERSION, offline: Boolean(flags.offline) }));
+    },
+
 
     'web': async (args, apiInstance, flags, options) => {
       const subcommand = args[0] || 'help';
@@ -819,8 +1263,14 @@ export function buildCommands(deps = {}) {
         'search': async () => {
           // Accept queries as positional args or --query (repeated)
           let queries = subArgs.length > 0 ? subArgs : [];
-          if (options.query) {
+          if (options.query !== undefined) {
             const fromOption = Array.isArray(options.query) ? options.query : [options.query];
+            if (!fromOption.every(q => typeof q === 'string')) {
+              throw new NansenError(
+                '--query values must be strings',
+                ErrorCode.INVALID_PARAMS,
+              );
+            }
             queries = queries.concat(fromOption);
           }
           queries = queries.filter(q => q.trim());
@@ -828,14 +1278,9 @@ export function buildCommands(deps = {}) {
             throw new NansenError('At least one query is required. Usage: nansen web search "bitcoin price" --num-results 5', ErrorCode.MISSING_PARAM);
           }
           let numResults;
-          if (options['num-results'] !== undefined) {
-            const numResultsRaw = parseInt(options['num-results'], 10);
-            if (Number.isNaN(numResultsRaw)) {
-              // Non-numeric — fall back to API default
-              numResults = undefined;
-            } else if (numResultsRaw >= 1 && numResultsRaw <= 20) {
-              numResults = numResultsRaw;
-            } else {
+          if (options['num-results'] !== undefined || flags['num-results']) {
+            numResults = parseSafeIntegerOption('num-results', options, flags, undefined, 'whole number between 1 and 20');
+            if (numResults < 1 || numResults > 20) {
               throw new NansenError('--num-results must be between 1 and 20', ErrorCode.INVALID_PARAMS);
             }
           }
@@ -845,7 +1290,7 @@ export function buildCommands(deps = {}) {
         'fetch': async () => {
           // Accept URLs as positional args or --url (repeated)
           let urls = subArgs.length > 0 ? subArgs : [];
-          if (options.url) {
+          if (options.url !== undefined) {
             const fromOption = Array.isArray(options.url) ? options.url : [options.url];
             urls = urls.concat(fromOption);
           }
@@ -856,6 +1301,12 @@ export function buildCommands(deps = {}) {
             try { new URL(u); } catch {
               throw new NansenError(`Invalid URL: "${u}". URLs must include a scheme, e.g. https://example.com`, ErrorCode.INVALID_PARAMS);
             }
+          }
+          if (Array.isArray(options.question)) {
+            throw new NansenError('--question may only be specified once', ErrorCode.INVALID_PARAMS);
+          }
+          if (options.question !== undefined && typeof options.question !== 'string') {
+            throw new NansenError('--question must be a string', ErrorCode.INVALID_PARAMS);
           }
           if (!options.question || !options.question.trim()) {
             throw new NansenError('--question is required and cannot be blank. Usage: nansen web fetch https://example.com --question "What is this about?"', ErrorCode.MISSING_PARAM);
@@ -885,13 +1336,14 @@ export function buildCommands(deps = {}) {
       if (flags.help || flags.h) {
         log('nansen login - Save your Nansen API key\n');
         log('USAGE:');
-        log('  nansen login --api-key <key>');
-        log('  NANSEN_API_KEY=<key> nansen login');
-        log('  nansen login --human              (interactive prompt)\n');
+        log('  nansen login --human              (interactive prompt; key never enters shell history)');
+        log('  nansen login                      (uses NANSEN_API_KEY when already set)');
+        log('  nansen login --api-key <key>      (literal key IS recorded in shell history)\n');
         log('OPTIONS:');
-        log('  --api-key <key>   Your Nansen API key');
+        log('  --api-key <key>   Your Nansen API key (recorded in shell history — prefer --human)');
         log('  --human           Enable interactive prompt');
         log('  --help            Show this help\n');
+        log('Setting a literal key in a command may record it in shell history.');
         log('Get your API key at: https://app.nansen.ai/auth/agent-setup');
         return;
       }
@@ -904,9 +1356,9 @@ export function buildCommands(deps = {}) {
 
       if (!apiKey && flags.human) {
         if (!isTTY) {
-          throw new CommandError('--human requires an interactive terminal. Use --api-key or NANSEN_API_KEY env var instead.', 'NOT_A_TTY', {
+          throw new CommandError('--human requires an interactive terminal. Set NANSEN_API_KEY in the environment (or pass --api-key <key>, which is recorded in shell history).', 'NOT_A_TTY', {
             error: 'NOT_A_TTY',
-            message: '--human requires an interactive terminal. Use --api-key or NANSEN_API_KEY env var instead.',
+            message: '--human requires an interactive terminal. Set NANSEN_API_KEY in the environment (or pass --api-key <key>, which is recorded in shell history).',
           });
         }
         log('Nansen CLI Login\n');
@@ -919,8 +1371,8 @@ export function buildCommands(deps = {}) {
           error: 'API_KEY_REQUIRED',
           message: 'No API key provided.',
           resolution: [
-            'Run: nansen login --api-key <key>',
-            'Or set NANSEN_API_KEY environment variable',
+            'Run in an interactive terminal: nansen login --human',
+            'Or set NANSEN_API_KEY in the environment',
             'Get your API key at: https://app.nansen.ai/auth/agent-setup',
           ],
         });
@@ -941,13 +1393,28 @@ export function buildCommands(deps = {}) {
           throw new CommandError('The API key is not valid.', 'INVALID_API_KEY', {
             error: 'INVALID_API_KEY',
             message: 'The API key is not valid.',
-            resolution: ['Check your key at https://app.nansen.ai/auth/agent-setup'],
+            resolution: ['Check or rotate your key at https://app.nansen.ai/api?tab=api'],
           });
         }
-        throw new CommandError(`Could not verify API key: ${error.message}`, 'VERIFICATION_FAILED', {
+        // Restore signal from the STRUCTURED error code only — never from
+        // error.message, which can echo the upstream response body (and the key
+        // with it). A transient failure shouldn't read as "check your key".
+        let message = 'Could not verify API key.';
+        let resolution = ['Check your internet connection', 'Try again'];
+        if (error.code === ErrorCode.RATE_LIMITED) {
+          message = 'Rate limited while verifying the API key.';
+          resolution = ['Wait a moment, then run nansen login again'];
+        } else if (error.code === ErrorCode.SERVER_ERROR || error.code === ErrorCode.SERVICE_UNAVAILABLE) {
+          message = 'The Nansen API is unavailable right now, so the key could not be verified.';
+          resolution = ['Try again shortly'];
+        } else if (error.code === ErrorCode.TIMEOUT) {
+          message = 'Timed out verifying the API key.';
+          resolution = ['Check your connection', 'Try again'];
+        }
+        throw new CommandError(message, 'VERIFICATION_FAILED', {
           error: 'VERIFICATION_FAILED',
-          message: `Could not verify API key: ${error.message}`,
-          resolution: ['Check your internet connection', 'Try again'],
+          message,
+          resolution,
         });
       }
 
@@ -975,6 +1442,9 @@ export function buildCommands(deps = {}) {
       } else {
         log('No saved credentials found');
       }
+      if (env.NANSEN_API_KEY) {
+        log('Warning: NANSEN_API_KEY remains active. Run: unset NANSEN_API_KEY');
+      }
     },
 
     'help': async (_args, _apiInstance, _flags, _options) => {
@@ -996,6 +1466,17 @@ export function buildCommands(deps = {}) {
       }
       const since = _options.since;
       if (since) {
+        // compareSemver treats a missing trailing component as 0, so accept
+        // "1", "1.43", and "1.43.0" alike here — but anything that isn't
+        // digits-and-dots (e.g. "abc") needs a clear error instead of
+        // silently comparing as if it were version 0.0.0, which would show
+        // every entry rather than flag the typo.
+        if (!/^v?\d+(\.\d+){0,2}$/.test(String(since))) {
+          throw new NansenError(
+            `Invalid --since value "${since}": expected a version like 1.43 or 1.43.0.`,
+            ErrorCode.INVALID_PARAMS
+          );
+        }
         // Show only entries from the given version onwards
         const lines = content.split('\n');
         const filtered = [];
@@ -1057,7 +1538,7 @@ export function buildCommands(deps = {}) {
           log('CACHE OPTIONS (for any command):');
           log('  --cache               Enable caching for this session');
           log('  --no-cache            Bypass cache for this request');
-          log('  --cache-ttl <seconds> Set cache TTL (default: 300)');
+          log('  --cache-ttl <seconds> Set non-negative safe integer cache TTL (default: 300)');
         }
       };
       
@@ -1071,10 +1552,13 @@ export function buildCommands(deps = {}) {
     },
 
     'smart-money': async (args, apiInstance, flags, options) => {
+      rejectBlankOption(options.days, 'days', '30');
+      rejectBlankOption(options.chain, 'chain', 'solana');
+      rejectBlankOption(options.chains, 'chains', 'solana');
       const subcommand = args[0] || 'help';
       const chain = options.chain || 'solana';
       const chains = options.chains || [chain];
-      const filters = options.filters || {};
+      const filters = parseObjectOption(options.filters, 'filters');
       const orderBy = parseSort(options.sort, options['order-by']);
       const pagination = buildPagination(options);
 
@@ -1085,12 +1569,14 @@ export function buildCommands(deps = {}) {
           : [options.labels];
       }
 
-      const days = options.days ? parseInt(options.days) : 30;
+      const days = subcommand === 'historical-holdings'
+        ? parseDaysOption(options, flags)
+        : 30;
 
       const handlers = {
         'netflow': () => apiInstance.smartMoneyNetflow({ chains, filters, orderBy, pagination }),
         'dex-trades': () => apiInstance.smartMoneyDexTrades({ chains, filters, orderBy, pagination }),
-        'perp-trades': () => apiInstance.smartMoneyPerpTrades({ filters, orderBy, pagination, onlyNewPositions: options['only-new-positions'] ?? flags['only-new-positions'] }),
+        'perp-trades': () => apiInstance.smartMoneyPerpTrades({ filters, orderBy, pagination, onlyNewPositions: resolveBooleanOption(options, flags, 'only-new-positions') }),
         'holdings': () => apiInstance.smartMoneyHoldings({ chains, filters, orderBy, pagination }),
         'dcas': () => apiInstance.smartMoneyDcas({ filters, orderBy, pagination }),
         'historical-holdings': () => apiInstance.smartMoneyHistoricalHoldings({ chains, filters, orderBy, pagination, days }),
@@ -1109,6 +1595,8 @@ export function buildCommands(deps = {}) {
     },
 
     'profiler': async (args, apiInstance, flags, options) => {
+      rejectBlankOption(options.days, 'days', '30');
+      rejectBlankOption(options.chain, 'chain', 'ethereum');
       const subcommand = args[0] || 'help';
       let address = options.address;
       const entityName = options.entity || options['entity-name'];
@@ -1118,71 +1606,89 @@ export function buildCommands(deps = {}) {
       let ensName;
       if (address && isEnsName(address)) {
         try {
-          const resolved = await resolveAddress(address, chain);
+          const ensChain = subcommand === 'first-funder' ? 'ethereum' : chain;
+          const resolved = await resolveAddress(address, ensChain);
           address = resolved.address;
           ensName = resolved.ensName;
         } catch (err) {
           throw new NansenError(err.message, ErrorCode.INVALID_ADDRESS);
         }
       }
-      const filters = options.filters || {};
+      const filters = parseObjectOption(options.filters, 'filters');
       const orderBy = parseSort(options.sort, options['order-by']);
       const pagination = buildPagination(options);
-      const days = options.days ? parseInt(options.days) : 30;
+      const days = [
+        'transactions',
+        'pnl',
+        'historical-balances',
+        'counterparties',
+        'counterparties-batch',
+        'pnl-summary',
+        'perp-trades',
+        'dex-trades',
+        'trace',
+        'compare',
+      ].includes(subcommand)
+        ? parseDaysOption(options, flags)
+        : 30;
 
       const handlers = {
         'balance': () => apiInstance.addressBalance({ address, entityName, chain, filters, orderBy }),
         'labels': () => apiInstance.addressLabels({ address, chain, pagination }),
         'transactions': () => {
-          const date = parseDateOption(options.date, days);
+          const date = parseDateOption(options.date, days, flags.date);
           return apiInstance.addressTransactions({ address, chain, filters, orderBy, pagination, days, date });
         },
         'pnl': () => {
-          const date = parseDateOption(options.date, days);
+          const date = parseDateOption(options.date, days, flags.date);
           return apiInstance.addressPnl({ address, chain, date, days, filters, orderBy, pagination });
         },
         'search': () => apiInstance.entitySearch({ query: options.query }),
         'historical-balances': () => apiInstance.addressHistoricalBalances({ address, chain, filters, orderBy, pagination, days }),
         'related-wallets': () => apiInstance.addressRelatedWallets({ address, chain, orderBy, pagination }),
+        'first-funder': () => apiInstance.addressFirstFunder({ address }),
         'counterparties': () => apiInstance.addressCounterparties({ address, chain, filters, orderBy, pagination, days }),
+        'counterparties-batch': () => {
+          const addresses = options.addresses
+            ? parseAddressList(options.addresses)
+            : (options.file ? readAddressFile(options.file) : []);
+          return apiInstance.addressCounterpartiesBatch({ addresses, chain, filters, orderBy, pagination, days });
+        },
         'pnl-summary': () => apiInstance.addressPnlSummary({ address, chain, orderBy, pagination, days }),
         'perp-positions': () => apiInstance.addressPerpPositions({ address, filters, orderBy, pagination }),
         'perp-trades': () => apiInstance.addressPerpTrades({ address, filters, orderBy, pagination, days }),
         'dex-trades': () => {
-          const date = parseDateOption(options.date, days);
+          const date = parseDateOption(options.date, days, flags.date);
           return apiInstance.addressDexTrades({ address, chain, filters, orderBy, pagination, days, date });
         },
         'batch': () => {
+          rejectBlankOption(options.delay, 'delay', '1000');
           let addresses = [];
           if (options.addresses) {
             addresses = parseAddressList(options.addresses);
           } else if (options.file) {
-            const content = fs.readFileSync(options.file, 'utf8');
-            try {
-              const parsed = JSON.parse(content);
-              if (!Array.isArray(parsed)) {
-                throw new NansenError('File must contain a JSON array of address strings or one address per line', ErrorCode.INVALID_PARAMS);
-              }
-              if (!parsed.every(item => typeof item === 'string')) {
-                throw new NansenError('File must contain a JSON array of address strings or one address per line', ErrorCode.INVALID_PARAMS);
-              }
-              addresses = parsed.map(a => a.trim()).filter(Boolean);
-            } catch (e) {
-              if (e instanceof NansenError) throw e;
-              addresses = content.split('\n').map(a => a.trim()).filter(Boolean);
-            }
+            addresses = readAddressFile(options.file);
           }
           if (addresses.length > 100) {
             throw new NansenError('Batch is limited to 100 addresses', ErrorCode.INVALID_PARAMS);
           }
-          const include = options.include ? options.include.split(',').map(s => s.trim()) : ['labels', 'balance'];
-          const delayMs = options.delay ? parseInt(options.delay) : 1000;
+          const parsedInclude = parseCsvOption(options.include, 'include');
+          const include = (parsedInclude && parsedInclude.length > 0) ? parsedInclude : ['labels', 'balance'];
+          const delayMs = parseNonNegativeSafeIntegerOption('delay', options, flags, 1000);
           return batchProfile(apiInstance, { addresses, chain, include, delayMs });
         },
         'trace': () => {
-          const depth = options.depth ? Math.max(1, Math.min(parseInt(options.depth), 5)) : 2;
-          const width = options.width ? parseInt(options.width) : 10;
-          const delayMs = options.delay ? parseInt(options.delay) : 1000;
+          rejectBlankOption(options.delay, 'delay', '1000');
+          rejectBlankOption(options.depth, 'depth', '2');
+          if (flags.depth) {
+            throw new NansenError(
+              '--depth requires a safe integer value',
+              ErrorCode.INVALID_PARAMS,
+            );
+          }
+          const depth = options.depth ?? 2;
+          const width = parseNonNegativeSafeIntegerOption('width', options, flags, 10);
+          const delayMs = parseNonNegativeSafeIntegerOption('delay', options, flags, 1000);
           return traceCounterparties(apiInstance, { address, chain, depth, width, days, delayMs });
         },
         'compare': () => {
@@ -1190,7 +1696,7 @@ export function buildCommands(deps = {}) {
           return compareWallets(apiInstance, { addresses: addrs, chain, days });
         },
         'help': () => ({
-          commands: ['balance', 'labels', 'transactions', 'pnl', 'search', 'historical-balances', 'related-wallets', 'counterparties', 'pnl-summary', 'perp-positions', 'perp-trades', 'dex-trades', 'batch', 'trace', 'compare'],
+          commands: ['balance', 'labels', 'transactions', 'pnl', 'search', 'historical-balances', 'related-wallets', 'first-funder', 'counterparties', 'counterparties-batch', 'pnl-summary', 'perp-positions', 'perp-trades', 'dex-trades', 'batch', 'trace', 'compare'],
           description: 'Wallet profiling endpoints',
           example: 'nansen research profiler compare --addresses "0xABC...,0xDEF..." --chain ethereum'
         })
@@ -1209,25 +1715,40 @@ export function buildCommands(deps = {}) {
     },
 
     'token': async (args, apiInstance, flags, options) => {
+      rejectBlankOption(options.days, 'days', '30');
+      rejectBlankOption(options.chain, 'chain', 'solana');
+      rejectBlankOption(options.chains, 'chains', 'solana');
+      rejectBlankOption(options.timeframe, 'timeframe', '1d');
+      rejectBlankOption(options['buy-or-sell'], 'buy-or-sell', 'SELL');
       const subcommand = args[0] || 'help';
       const chain = options.chain || 'solana';
       const tokenAddress = normalizeAddress(options.token || options['token-address'], chain);
       const tokenSymbol = options.symbol || options['token-symbol'];
       const chains = options.chains || [chain];
       const timeframe = options.timeframe || '24h';
-      const filters = options.filters || {};
+      const filters = parseObjectOption(options.filters, 'filters');
       const orderBy = parseSort(options.sort, options['order-by']);
       const pagination = buildPagination(options);
-      const days = options.days ? parseInt(options.days) : 30;
+      const days = [
+        'flows',
+        'dex-trades',
+        'pnl',
+        'who-bought-sold',
+        'transfers',
+        'perp-trades',
+        'perp-pnl-leaderboard',
+      ].includes(subcommand)
+        ? parseDaysOption(options, flags)
+        : 30;
 
       // Convenience filter for smart money only
-      const onlySmartMoney = options['smart-money'] || flags['smart-money'] || false;
+      const onlySmartMoney = resolveBooleanOption(options, flags, 'smart-money') ?? false;
       if (onlySmartMoney) {
         filters.include_smart_money_labels = filters.include_smart_money_labels ||
           ['Fund', 'Smart Trader', '30D Smart Trader', '90D Smart Trader', '180D Smart Trader'];
       }
 
-      const includeStablecoins = options['include-stablecoins'] ?? flags['include-stablecoins'];
+      const includeStablecoins = resolveBooleanOption(options, flags, 'include-stablecoins');
       if (includeStablecoins !== undefined) {
         filters.include_stablecoins = includeStablecoins;
       }
@@ -1238,19 +1759,26 @@ export function buildCommands(deps = {}) {
         'info': () => apiInstance.tokenInformation({ tokenAddress, chain, timeframe: options.timeframe }),
         'screener': async () => {
           const search = options.search;
-          // When searching, fetch more results to filter from (API has no server-side search)
-          const searchPagination = search 
-            ? { page: 1, per_page: Math.max(500, pagination?.per_page || 0) }
+          if (search !== undefined && typeof search !== 'string') {
+            throw new NansenError('--search must be a string', ErrorCode.INVALID_PARAMS);
+          }
+          // When searching, fetch more results to filter from (API has no server-side search).
+          // --page/--limit are applied client-side to the filtered list, so the
+          // candidate fetch has to cover every page up to the requested one.
+          const requestedLimit = pagination?.per_page || 100;
+          const requestedPage = pagination?.page || 1;
+          const searchPagination = search
+            ? { page: 1, per_page: Math.max(500, requestedPage * requestedLimit) }
             : pagination;
           const result = await apiInstance.tokenScreener({ chains, timeframe, filters, orderBy, pagination: searchPagination });
           if (search) {
             const q = search.toLowerCase();
-            const requestedLimit = pagination?.per_page || 100;
+            const offset = (requestedPage - 1) * requestedLimit;
             const filterArr = (arr) => arr.filter(t => 
               (t.token_symbol && t.token_symbol.toLowerCase().includes(q)) ||
               (t.token_name && t.token_name.toLowerCase().includes(q)) ||
               (t.token_address && t.token_address.toLowerCase() === q)
-            ).slice(0, requestedLimit);
+            ).slice(offset, offset + requestedLimit);
             // Handle nested response shapes: {data: [...]} or {data: {data: [...]}}
             if (Array.isArray(result?.data)) {
               return { ...result, data: filterArr(result.data) };
@@ -1262,7 +1790,7 @@ export function buildCommands(deps = {}) {
         },
         'holders': () => apiInstance.tokenHolders({ tokenAddress, chain, labelType: onlySmartMoney ? 'smart_money' : 'all_holders', filters, orderBy, pagination, withLabels: resolveBooleanOption(options, flags, 'premium-labels') }),
         'flows': () => {
-          const date = parseDateOption(options.date, days);
+          const date = parseDateOption(options.date, days, flags.date);
           const label = options.label;
           return apiInstance.tokenFlows({ tokenAddress, chain, label, filters, orderBy, pagination, days, date });
         },
@@ -1272,8 +1800,15 @@ export function buildCommands(deps = {}) {
           return apiInstance.tokenPnlLeaderboard({ tokenAddress, chain, filters, orderBy, pagination, days, withLabels });
         },
         'who-bought-sold': () => {
-          const date = parseDateOption(options.date, days);
-          const buyOrSell = (options['buy-or-sell'] || 'BUY').toUpperCase();
+          const date = parseDateOption(options.date, days, flags.date);
+          const buyOrSellRaw = options['buy-or-sell'];
+          if (buyOrSellRaw !== undefined && typeof buyOrSellRaw !== 'string') {
+            throw new NansenError('--buy-or-sell must be BUY or SELL', ErrorCode.INVALID_PARAMS);
+          }
+          const buyOrSell = (buyOrSellRaw || 'BUY').toUpperCase();
+          if (buyOrSell !== 'BUY' && buyOrSell !== 'SELL') {
+            throw new NansenError('--buy-or-sell must be BUY or SELL', ErrorCode.INVALID_PARAMS);
+          }
           return apiInstance.tokenWhoBoughtSold({ tokenAddress, chain, buyOrSell, filters, orderBy, pagination, days, date });
         },
         'flow-intelligence': () => apiInstance.tokenFlowIntelligence({ tokenAddress, chain, timeframe: options.timeframe || '1d' }),
@@ -1292,7 +1827,7 @@ export function buildCommands(deps = {}) {
         },
         'top-tokens': () => {
           const marketCapGroup = options['market-cap'] || options['market-cap-group'];
-          const limit = options.limit ? parseInt(options.limit) : undefined;
+          const limit = parseNonNegativeSafeIntegerOption('limit', options, flags);
           return apiInstance.topTokens({ marketCapGroup, limit });
         },
         'help': () => ({
@@ -1360,24 +1895,21 @@ export function buildCommands(deps = {}) {
     },
 
     'perp': async (args, apiInstance, flags, options) => {
+      rejectBlankOption(options.days, 'days', '30');
       const subcommand = args[0] || 'help';
-      const filters = options.filters || {};
+      const filters = parseObjectOption(options.filters, 'filters');
       const orderBy = parseSort(options.sort, options['order-by']);
       const pagination = buildPagination(options);
-      const days = options.days ? parseInt(options.days) : 30;
+      const days = ['screener', 'leaderboard'].includes(subcommand)
+        ? parseDaysOption(options, flags)
+        : 30;
 
       const handlers = {
         'screener': () => {
           const traderType = options['trader-type'];
-          const sectorsFilter = options['sectors-filter']
-            ? options['sectors-filter'].split(',').map(s => s.trim()).filter(Boolean)
-            : undefined;
-          const smLabelFilter = options['sm-label-filter']
-            ? options['sm-label-filter'].split(',').map(s => s.trim()).filter(Boolean)
-            : undefined;
-          const traderLabelFilter = options['trader-label-filter']
-            ? options['trader-label-filter'].split(',').map(s => s.trim()).filter(Boolean)
-            : undefined;
+          const sectorsFilter = parseCsvOption(options['sectors-filter'], 'sectors-filter');
+          const smLabelFilter = parseCsvOption(options['sm-label-filter'], 'sm-label-filter');
+          const traderLabelFilter = parseCsvOption(options['trader-label-filter'], 'trader-label-filter');
           return apiInstance.perpScreener({ filters, orderBy, pagination, days, traderType, sectorsFilter, smLabelFilter, traderLabelFilter });
         },
         'leaderboard': () => {
@@ -1392,13 +1924,14 @@ export function buildCommands(deps = {}) {
       };
 
       if (!handlers[subcommand]) {
-        return { error: `Unknown subcommand: ${subcommand}`, available: Object.keys(handlers) };
+        throw new NansenError(`Unknown perp analytics subcommand: ${subcommand}. Available: screener, leaderboard`, ErrorCode.UNKNOWN);
       }
 
       return handlers[subcommand]();
     },
 
     'search': async (args, apiInstance, flags, options) => {
+      rejectBlankOption(options.chain, 'chain', 'solana');
       return apiInstance.generalSearch({
         query: args[0] || options.query,
         resultType: options.type,
@@ -1407,25 +1940,8 @@ export function buildCommands(deps = {}) {
       });
     },
 
-    'points': async (args, apiInstance, flags, options) => {
-      const subcommand = args[0] || 'help';
-      const tier = options.tier;
-      const pagination = buildPagination(options);
-
-      const handlers = {
-        'leaderboard': () => apiInstance.pointsLeaderboard({ tier, pagination }),
-        'help': () => ({
-          commands: ['leaderboard'],
-          description: 'Nansen Points analytics endpoints',
-          example: 'nansen points leaderboard --limit 100'
-        })
-      };
-
-      if (!handlers[subcommand]) {
-        return { error: `Unknown subcommand: ${subcommand}`, available: Object.keys(handlers) };
-      }
-
-      return handlers[subcommand]();
+    'points': async () => {
+      throw new CommandError('The points leaderboard endpoint has been removed. Run "nansen research" to explore other analytics commands.', 'COMMAND_UNAVAILABLE');
     },
 
     'prediction-market': async (args, apiInstance, flags, options) => {
@@ -1442,20 +1958,21 @@ export function buildCommands(deps = {}) {
       const pagination = buildPagination(options);
 
       // Screener-specific filter options
-      const tags = options.tags ? options.tags.split(',').map(t => t.trim()) : undefined;
-      const minLiquidity = options['min-liquidity'] != null ? Number(options['min-liquidity']) : undefined;
-      const maxLiquidity = options['max-liquidity'] != null ? Number(options['max-liquidity']) : undefined;
-      const minUniqueTraders24h = options['min-unique-traders-24h'] != null ? Number(options['min-unique-traders-24h']) : undefined;
-      const maxUniqueTraders24h = options['max-unique-traders-24h'] != null ? Number(options['max-unique-traders-24h']) : undefined;
-      const minVolume24hr = options['min-volume-24hr'] != null ? Number(options['min-volume-24hr']) : undefined;
-      const maxVolume24hr = options['max-volume-24hr'] != null ? Number(options['max-volume-24hr']) : undefined;
-      const negRisk = options['neg-risk'] != null ? options['neg-risk'] === 'true' : undefined;
-      const minOpenInterest = options['min-open-interest'] != null ? Number(options['min-open-interest']) : undefined;
-      const maxOpenInterest = options['max-open-interest'] != null ? Number(options['max-open-interest']) : undefined;
+      const isScreener = subcommand === 'market-screener' || subcommand === 'event-screener';
+      const tags = parseCsvOption(options.tags, 'tags');
+      const minLiquidity = isScreener ? parseFiniteNumberOption('min-liquidity', options, flags) : undefined;
+      const maxLiquidity = isScreener ? parseFiniteNumberOption('max-liquidity', options, flags) : undefined;
+      const minUniqueTraders24h = isScreener ? parseFiniteNumberOption('min-unique-traders-24h', options, flags) : undefined;
+      const maxUniqueTraders24h = isScreener ? parseFiniteNumberOption('max-unique-traders-24h', options, flags) : undefined;
+      const minVolume24hr = isScreener ? parseFiniteNumberOption('min-volume-24hr', options, flags) : undefined;
+      const maxVolume24hr = isScreener ? parseFiniteNumberOption('max-volume-24hr', options, flags) : undefined;
+      const negRisk = resolveBooleanOption(options, flags, 'neg-risk');
+      const minOpenInterest = isScreener ? parseFiniteNumberOption('min-open-interest', options, flags) : undefined;
+      const maxOpenInterest = isScreener ? parseFiniteNumberOption('max-open-interest', options, flags) : undefined;
       const endDateBefore = options['end-date-before'];
       const endDateAfter = options['end-date-after'];
-      const minPrice = options['min-price'] != null ? Number(options['min-price']) : undefined;
-      const maxPrice = options['max-price'] != null ? Number(options['max-price']) : undefined;
+      const minPrice = subcommand === 'market-screener' ? parseFiniteNumberOption('min-price', options, flags) : undefined;
+      const maxPrice = subcommand === 'market-screener' ? parseFiniteNumberOption('max-price', options, flags) : undefined;
 
       const handlers = {
         'ohlcv': () => apiInstance.pmOhlcv({ marketId, orderBy, pagination }),
@@ -1488,76 +2005,50 @@ export function buildCommands(deps = {}) {
   // 'research' delegates to the category handlers defined above
   const RESEARCH_CATEGORIES = new Set(['smart-money', 'profiler', 'token', 'search', 'perp', 'portfolio', 'points', 'prediction-market']);
 
-  const researchHistorical = buildResearchCommands(deps).research;
+  // The analytics-only perp handler, captured before the trading wrapper below
+  // replaces cmds['perp']. Both the wrapper and the research dispatch route to
+  // it, so it has to be taken exactly once, here.
+  const perpAnalytics = cmds['perp'];
+
+  const researchSub = buildResearchCommands(deps).research;
 
   cmds['research'] = async (args, apiInstance, flags, options) => {
     const rawCategory = args[0];
     if (!rawCategory || rawCategory === 'help') {
       return {
         categories: [...RESEARCH_CATEGORIES],
+        subcommands: [...RESEARCH_SUBCOMMANDS],
         historical: [...RESEARCH_HISTORICAL_SUBCOMMANDS],
         aliases: RESEARCH_CATEGORY_ALIASES,
         description: 'Research and analytics commands',
         example: 'nansen research smart-money netflow --chain solana'
       };
     }
-    if (RESEARCH_HISTORICAL_SUBCOMMANDS.has(rawCategory)) {
-      return researchHistorical(args, apiInstance, flags, options);
+    if (RESEARCH_SUBCOMMANDS.has(rawCategory)) {
+      return researchSub(args, apiInstance, flags, options);
     }
     const category = RESEARCH_CATEGORY_ALIASES[rawCategory] || rawCategory;
     if (!RESEARCH_CATEGORIES.has(category)) {
-      throw new NansenError(`Unknown research category: ${rawCategory}. Available: ${[...RESEARCH_CATEGORIES, ...RESEARCH_HISTORICAL_SUBCOMMANDS].join(', ')}`, ErrorCode.UNKNOWN);
+      throw new NansenError(`Unknown research category: ${rawCategory}. Available: ${[...RESEARCH_CATEGORIES, ...RESEARCH_SUBCOMMANDS].join(', ')}`, ErrorCode.UNKNOWN);
+    }
+    // `research perp` reaches only the analytics half (screener/leaderboard) —
+    // the trading subcommands live at the top level. Use the captured handler
+    // for every subcommand because cmds['perp'] is replaced below by the
+    // combined top-level trading dispatcher.
+    if (category === 'perp') {
+      return perpAnalytics(args.slice(1), apiInstance, flags, options);
     }
     return cmds[category](args.slice(1), apiInstance, flags, options);
   };
 
   // 'trade' delegates to quote/execute from buildTradingCommands and limit-order from buildLimitOrderCommands
-  const tradingCmds = buildTradingCommands(deps);
+  const executionDeps = { ...deps, promptFn: confirmationPromptFn };
+  const tradingCmds = buildTradingCommands(executionDeps);
   const limitOrderCmds = buildLimitOrderCommands(deps);
   cmds['trade'] = async (args, apiInstance, flags, options) => {
     const sub = args[0];
     if (!sub || sub === 'help') {
-      log(`nansen trade — DEX trading commands
-
-SUBCOMMANDS:
-  quote          Get a swap quote (price, route, fees)
-  execute        Sign and broadcast a quoted swap
-  bridge-status  Check cross-chain bridge transaction status
-  limit-order    Limit order management (Solana only)
-
-USAGE:
-  nansen trade quote --chain <chain> --from <token> --to <token> --amount <units> [--wallet <name>]
-  nansen trade quote --chain <chain> --to-chain <chain> --from <token> --to <token> --amount <units>
-  nansen trade execute --quote <quoteId> [--wallet <name>]
-  nansen trade bridge-status --tx-hash <hash> --from-chain <chain> --to-chain <chain>
-  nansen trade limit-order <create|list|cancel|update> [options]
-
-EXAMPLES:
-  nansen trade quote --chain solana --from SOL --to USDC --amount 1000000000
-  nansen trade quote --chain base --from ETH --to USDC --amount 1000000000000000000
-  nansen trade quote --chain base --to-chain solana --from USDC --to USDC --amount 1000000
-  nansen trade execute --quote 1708900000000-abc123
-  nansen trade bridge-status --tx-hash 0xabc... --from-chain base --to-chain solana
-  nansen trade limit-order create --from SOL --to USDC --amount 1.5 --trigger-mint SOL --trigger-condition below --trigger-price 80
-  nansen trade limit-order list
-
-WALLET:
-  --wallet <name>   Use a named wallet, or "walletconnect" / "wc" for WalletConnect.
-                    Defaults to the default local wallet if omitted.
-
-SYMBOLS:
-  Common tokens resolve automatically: SOL, ETH, USDC, USDT, WETH
-  Raw addresses are also accepted.
-
-CROSS-CHAIN NOTES (when using --to-chain):
-  Supported combos:
-    native → native (ETH <-> SOL)
-    USDC → USDC (both directions)
-    USDC → native (USDC → ETH or SOL)
-    native → USDC (ETH/SOL → USDC)
-    non-native → non-native — not supported (use USDC as intermediate)
-  Bridge providers: Li.Fi or Relay (selected automatically based on best price)
-  Typical bridge time: 1-5 minutes`);
+      log(TRADE_USAGE);
       return;
     }
     if (sub === 'limit-order') {
@@ -1589,11 +2080,88 @@ USAGE:
     return tradingCmds[sub](args.slice(1), apiInstance, flags, options);
   };
 
+  // 'bridge' delegates to quote/execute/status from buildBridgeCommands
+  const bridgeCmds = buildBridgeCommands(executionDeps);
+  cmds['bridge'] = async (args, apiInstance, flags, options) => {
+    const sub = args[0];
+    if (!sub || sub === 'help') {
+      log(`nansen bridge — Hyperliquid bridge commands (EVM <-> Hyperliquid via Relay)
+
+SUBCOMMANDS:
+  quote     Get a bridge quote
+  execute   Execute a bridge quote (sign + broadcast)
+  status    Check bridge transaction status
+
+USAGE:
+  nansen bridge quote --from-chain base --to-chain hyperliquid --from-token USDC --amount 1000000
+  nansen bridge execute --quote <quoteId> [--dry-run] [--yes]
+  nansen bridge status --request-id <id>
+
+BEFORE BROADCASTING (execute only):
+  --dry-run   Validate and print what would be signed, then stop. Exits 0.
+  --yes, -y   Skip the confirmation prompt (same as NANSEN_YES=1). The prompt only
+              appears when stdin is a terminal; declining exits 1, signing nothing.
+
+SUPPORTED ROUTES:
+  ${formatBridgeRoutes()}`);
+      return;
+    }
+    if (!bridgeCmds[sub]) {
+      throw new NansenError(`Unknown bridge subcommand: ${sub}. Available: quote, execute, status`, ErrorCode.UNKNOWN);
+    }
+    return bridgeCmds[sub](args.slice(1), apiInstance, flags, options);
+  };
+
+  // 'perp' delegates to buildPerpCommands. The trading subcommands are added on
+  // top of the pre-existing perp analytics command, so capture that handler and
+  // keep screener/leaderboard reachable instead of shadowing them — both
+  // `nansen perp screener` and `nansen research perp screener` route through here.
+  const perpCmds = buildPerpCommands(deps);
+  const PERP_ANALYTICS_SUBCOMMANDS = new Set(['screener', 'leaderboard']);
+  cmds['perp'] = async (args, apiInstance, flags, options) => {
+    const sub = args[0];
+    if (!sub || sub === 'help') {
+      log(`nansen perp — Hyperliquid perpetual trading
+
+SUBCOMMANDS:
+  order       Place a perp order (market/limit with optional TP/SL)
+  cancel      Cancel an open order
+  close       Close a position (reduce-only market order)
+  leverage    Set leverage and margin mode
+  transfer    Move USDC between Spot and Perps balances
+  approve-builder-fee  Authorize the Nansen builder fee (one-time; auto-fired on first trade)
+  positions   View open positions
+  orders      View open orders
+  account     View account state (balance, equity, margin, spot)
+  meta        View available assets
+  screener    Perp market screener (analytics)
+  leaderboard Perp trader leaderboard (analytics)
+
+USAGE:
+  nansen perp order --coin BTC --side buy --size 0.001 --price 50000 --type limit
+  nansen perp cancel --coin BTC --oid 12345
+  nansen perp close --coin BTC --size 0.001 --price 100000 --side sell
+  nansen perp leverage --coin BTC --leverage 10 --margin-type cross
+  nansen perp transfer --direction spot-to-perp --amount 25
+  nansen perp approve-builder-fee
+  nansen perp positions
+  nansen perp account`);
+      return;
+    }
+    if (!perpCmds[sub]) {
+      if (PERP_ANALYTICS_SUBCOMMANDS.has(sub)) {
+        return perpAnalytics(args, apiInstance, flags, options);
+      }
+      throw new NansenError(`Unknown perp subcommand: ${sub}. Available: order, cancel, close, leverage, transfer, approve-builder-fee, positions, orders, account, meta, screener, leaderboard`, ErrorCode.UNKNOWN);
+    }
+    return perpCmds[sub](args.slice(1), apiInstance, flags, options);
+  };
+
   return cmds;
 }
 
 // Categories that moved under 'research'
-export const DEPRECATED_TO_RESEARCH = new Set(['smart-money', 'profiler', 'token', 'search', 'perp', 'portfolio', 'points']);
+export const DEPRECATED_TO_RESEARCH = new Set(['smart-money', 'profiler', 'token', 'search', 'portfolio']);
 // Subcommands that moved under 'trade'
 export const DEPRECATED_TO_TRADE = new Set(['quote', 'execute']);
 
@@ -1617,7 +2185,16 @@ export const RESEARCH_CATEGORY_ALIASES = {
 
 // Generate help text for a specific subcommand using SCHEMA
 export function generateSubcommandHelp(command, subcommand, prefix = null) {
-  const cmdSchema = SCHEMA.commands[command] || SCHEMA.commands.research.subcommands[command];
+  // `perp` is both a top-level trading command and a research category, and
+  // the two have different subcommands. Look in both places and use whichever
+  // actually holds this subcommand (top-level wins when both do) instead of
+  // stopping at the first schema whose *name* matches — that made
+  // `research perp screener --help` fall back to listing the category's
+  // subcommands, i.e. telling the caller to run the command they just ran.
+  const topSchema = SCHEMA.commands[command];
+  const researchSchema = SCHEMA.commands.research.subcommands[command];
+  const fromResearch = !topSchema?.subcommands?.[subcommand] && Boolean(researchSchema?.subcommands?.[subcommand]);
+  const cmdSchema = fromResearch ? researchSchema : topSchema || researchSchema;
   if (!cmdSchema) return null;
 
   const subSchema = cmdSchema.subcommands?.[subcommand];
@@ -1648,14 +2225,14 @@ export function generateSubcommandHelp(command, subcommand, prefix = null) {
 
   const exampleValues = { address: '0x...', token: '0x...', query: '"term"', symbol: 'BTC', date: '2024-01-01' };
   const chain = subSchema.options?.chain?.default || 'solana';
-  const cmdPrefix = prefix || (DEPRECATED_TO_RESEARCH.has(command) ? `research ${command}` : command);
-  let example = `nansen ${cmdPrefix} ${subcommand}`;
-  if (subSchema.options) {
+  const cmdPrefix = prefix || (fromResearch || DEPRECATED_TO_RESEARCH.has(command) ? `research ${command}` : command);
+  let example = subSchema.examples?.[0] || `nansen ${cmdPrefix} ${subcommand}`;
+  if (!subSchema.examples?.length && subSchema.options) {
     for (const [name, opt] of Object.entries(subSchema.options)) {
       if (opt.required) example += ` --${name} ${exampleValues[name] || '<val>'}`;
     }
   }
-  if (subSchema.options?.chain && !subSchema.options.chain.required) {
+  if (!subSchema.examples?.length && subSchema.options?.chain && !subSchema.options.chain.required) {
     example += ` --chain ${chain}`;
   }
   lines.push(`Example: ${example}`);
@@ -1670,10 +2247,46 @@ export async function runCLI(rawArgs, deps = {}) {
     errorOutput = console.error,
     exit = process.exit,
     NansenAPIClass = NansenAPI,
-    commandOverrides = {}
+    commandOverrides = {},
+    // Output TTY controls human-vs-structured error rendering. Keep the
+    // existing `isTTY` seam for callers/tests that inject both terminal states.
+    isTTY = process.stdout.isTTY,
   } = deps;
 
-  const { _: positional, flags, options } = parseArgs(rawArgs);
+  // Command-layer interactivity is intentionally governed by stdin. Besides
+  // trade/bridge confirmation, buildCommands' existing `login --human` prompt
+  // consumes this same signal; stdout may be redirected while a person still
+  // answers either prompt on stdin. The separate `isTTY` destructured above
+  // remains the stdout signal for human-vs-structured error rendering. Callers
+  // can split the signals with `isInputTTY`; legacy `isTTY` injection still
+  // drives both for compatibility.
+  const isInputTTY = deps.isInputTTY ?? (deps.isTTY ?? process.stdin.isTTY);
+
+  // Pass the CLI-owned terminal seams into command modules. Keeping these out
+  // of core means direct/library callers are non-interactive unless they
+  // explicitly provide a prompt.
+  const inputInteractiveDeps = {
+    ...deps,
+    isTTY: isInputTTY,
+    promptFn: deps.promptFn ?? prompt,
+    confirmationPromptFn: deps.confirmationPromptFn ?? promptForConfirmation,
+    confirmationLog: deps.confirmationLog ?? errorOutput,
+  };
+  const topLevelTradingDeps = {
+    ...inputInteractiveDeps,
+    promptFn: inputInteractiveDeps.confirmationPromptFn,
+  };
+
+  let parsed;
+  try {
+    parsed = parseArgs(rawArgs);
+  } catch (error) {
+    const errorData = formatError(error);
+    output(formatOutput(errorData).text);
+    exit(1);
+    return { type: 'error', data: errorData };
+  }
+  const { _: positional, flags, options } = parsed;
 
   // Resolve command aliases
   const rawCommand = positional[0] || 'help';
@@ -1688,10 +2301,20 @@ export async function runCLI(rawArgs, deps = {}) {
   const stream = flags.stream || flags.s;
   const csv = options.format === 'csv';
 
+  // `auth` and `doctor --offline` promise zero network activity — that
+  // contract covers the background update-check fetch and telemetry too,
+  // not just the command's own requests.
+  const isMcpUsage = command === 'mcp' && (subcommand !== 'verify' || flags.help || flags.h);
+  // `completion` renders from the checked-in schema — no network, and its
+  // stdout is piped straight into a shell, so keep the update check out of it.
+  const isOfflineCommand = command === 'auth' || (command === 'doctor' && flags.offline) || isMcpUsage || command === 'completion';
+  const trackSucceeded = isOfflineCommand ? async () => {} : trackCommandSucceeded;
+  const trackFailed = isOfflineCommand ? async () => {} : trackCommandFailed;
+
   // Update check (read cached result + schedule background refresh)
   const updateNotification = getUpdateNotification(VERSION);
   const upgradeNotice = getUpgradeNotice(VERSION);
-  scheduleUpdateCheck();
+  if (!isOfflineCommand) scheduleUpdateCheck();
   const notify = () => {
     if (upgradeNotice) errorOutput(upgradeNotice);
     if (updateNotification) errorOutput(updateNotification);
@@ -1704,7 +2327,13 @@ export async function runCLI(rawArgs, deps = {}) {
     return '';
   };
 
-  const commands = { ...buildCommands(deps), ...buildWalletCommands(deps), ...buildTradingCommands(deps), ...buildAlertsCommands(deps), ...buildAgentCommands(deps), ...commandOverrides };
+  // mcp prints its own output via `log`; runCLI callers inject their stdout
+  // sink as `output`, so map it across (an explicit `log` dep still wins).
+  // Only execute/login handlers consume the stdin-interactivity seam. Other
+  // modules retain their existing deps: notably wallet export interprets
+  // `isTTY` as stdout visibility when deciding whether to warn about printing
+  // private keys, so substituting the stdin signal there changes its semantics.
+  const commands = { ...buildCommands(inputInteractiveDeps), ...buildWalletCommands(deps), ...buildTradingCommands(topLevelTradingDeps), ...buildAlertsCommands(deps), ...buildAgentCommands(deps), ...buildMcpCommands({ ...deps, log: deps.log ?? output }), ...buildCompletionCommands({ ...deps, log: deps.log ?? output }), ...commandOverrides };
 
   if (flags.version || flags.v) {
     output(VERSION);
@@ -1712,7 +2341,9 @@ export async function runCLI(rawArgs, deps = {}) {
   }
 
   if (command === 'help' || flags.help || flags.h) {
-    await refreshCostMapIfStale();
+    // Help for an offline command still owes the zero-network contract: the
+    // cost-map refresh fetches the OpenAPI spec and writes ~/.nansen/cost-map.json.
+    if (!isOfflineCommand) await refreshCostMapIfStale();
     // Check for subcommand-specific help: nansen <command> <subcommand> --help
     if (flags.help || flags.h) {
       // Handle 'research <category> <sub> --help' (3-level)
@@ -1806,7 +2437,16 @@ export async function runCLI(rawArgs, deps = {}) {
         return { type: 'command-help', command };
       }
     }
-    // Commands with handlers (e.g. quote, execute) show their own usage
+    // The trade group (and the deprecated top-level quote/execute aliases) use
+    // handler-based usage rather than schema help. Show it and exit 0, instead of
+    // falling through to command execution, which would error on missing required
+    // args and exit 1.
+    if (command === 'trade' || DEPRECATED_TO_TRADE.has(command)) {
+      output(deprecationNote(command) + TRADE_USAGE);
+      notify();
+      return { type: 'command-help', command };
+    }
+    // 'help' and unknown commands: full banner + command list
     if (command === 'help' || !commands[command]) {
       output(BANNER + HELP);
       notify();
@@ -1823,28 +2463,36 @@ export async function runCLI(rawArgs, deps = {}) {
   const chain = options.chain || null;
 
   if (!commands[command]) {
+    // A command token containing whitespace almost always means a multi-word
+    // invocation was passed as a single argument — e.g. `nansen "trade --help"`,
+    // or an unquoted shell variable under zsh (which, unlike bash, does not
+    // word-split `$var`). Point the user straight at the cause instead of a bare
+    // "Unknown command" that reads like a spurious failure.
     const errorData = {
-      error: `Unknown command: ${command}`,
+      error: /\s/.test(command)
+        ? `Unknown command: "${command}". This looks like multiple words passed as one argument — check your shell quoting (use \`nansen trade --help\`, not \`nansen "trade --help"\`).`
+        : `Unknown command: ${command}`,
       available: Object.keys(commands)
     };
     const formatted = formatOutput(errorData, { pretty, table });
     output(formatted.text);
-    await trackCommandFailed({ command: fullCommand, duration_ms: Date.now() - startTime, error_code: 'UNKNOWN_COMMAND', flags: usedFlags, chain });
+    await trackFailed({ command: fullCommand, duration_ms: Date.now() - startTime, error_code: 'UNKNOWN_COMMAND', flags: usedFlags, chain });
     exit(1);
     return { type: 'error', data: errorData };
   }
 
   try {
     // Configure retry options
+    const maxRetries = parseNonNegativeSafeIntegerOption('retries', options, flags, 3);
     const retryOptions = flags['no-retry']
       ? { maxRetries: 0 }
-      : { maxRetries: options.retries !== undefined ? (Number.isNaN(parseInt(options.retries, 10)) ? 3 : parseInt(options.retries, 10)) : 3 };
+      : { maxRetries };
 
     // Configure cache options
-    const cacheTtl = options['cache-ttl'] !== undefined ? parseInt(options['cache-ttl'], 10) : 300;
+    const cacheTtl = parseNonNegativeSafeIntegerOption('cache-ttl', options, flags, 300);
     const cacheOptions = {
       enabled: flags['cache'] && !flags['no-cache'],
-      ttl: Number.isNaN(cacheTtl) ? 300 : cacheTtl
+      ttl: cacheTtl
     };
 
     const defaultHeaders = {};
@@ -1852,11 +2500,50 @@ export async function runCLI(rawArgs, deps = {}) {
       defaultHeaders['Payment-Signature'] = options['x402-payment-signature'];
     }
     const api = new NansenAPIClass(undefined, undefined, { retry: retryOptions, cache: cacheOptions, defaultHeaders });
+
+    // Deprecated top-level aliases otherwise run silently (the notice was only
+    // shown in --help). Warn on stderr so it doesn't pollute parsed stdout.
+    if (DEPRECATED_TO_TRADE.has(command)) {
+      process.stderr.write(`Note: "nansen ${command}" is deprecated. Use "nansen trade ${command}" instead.\n`);
+    } else if (DEPRECATED_TO_RESEARCH.has(command)) {
+      process.stderr.write(`Note: "nansen ${command}" is deprecated. Use "nansen research ${command}" instead.\n`);
+    }
+
     let result = await commands[command](subArgs, api, flags, options);
+
+    // The cache marker is hung off the payload's `_meta` by getCachedResponse(),
+    // never as a top-level `fromCache`. Capture it here, before `--fields`
+    // filtering below drops `_meta` along with every other unrequested key —
+    // read any later and a cache hit with `--fields` reports as a live call.
+    //
+    // `_meta` alone isn't enough either: handlers are free to rebuild their
+    // result and some do (`alerts list` filters the array into a fresh one),
+    // which drops the marker before we get here. `api.servedFromCache` is set
+    // on the instance next to the cache-hit early return in request(), so it
+    // survives that reshaping. Compared against `true` so a stubbed API whose
+    // every property is a mock function doesn't read as a hit.
+    const fromCache = !!result?._meta?.fromCache || api.servedFromCache === true;
+
+    // Credit balance warning, from the headers on the call just made. Goes to
+    // stderr so it never contaminates the JSON on stdout that agents parse.
+    // Placed before every return path below so it fires for operational
+    // commands too, which print their own output and return undefined.
+    const lowCredits = creditWarning(api.lastResponseMeta);
+    if (lowCredits) errorOutput(lowCredits);
+    for (const notice of noticeWarnings(api.lastResponseMeta)) errorOutput(notice);
+
+    // What this call cost — authoritative header when the API sent one, else
+    // the cached spec estimate. stderr only, so stdout JSON stays pure.
+    const charged = creditsCharged(api.lastResponseMeta, api.lastEndpoint);
+    if (charged?.source === 'header') {
+      errorOutput(`Credits: ${charged.cost} (this call)`);
+    } else if (charged?.source === 'estimate') {
+      errorOutput(`Credits: ~${charged.estimate.free} free / ${charged.estimate.pro} pro (estimated)`);
+    }
 
     // Commands that handle their own output return undefined
     if (result === undefined) {
-      await trackCommandSucceeded({ command: fullCommand, duration_ms: Date.now() - startTime, flags: usedFlags, chain });
+      await trackSucceeded({ command: fullCommand, duration_ms: Date.now() - startTime, flags: usedFlags, chain });
       return { type: 'no-output', command };
     }
 
@@ -1864,7 +2551,7 @@ export async function runCLI(rawArgs, deps = {}) {
     if (command === 'schema') {
       const formatted = formatOutput(result, { pretty, table: false });
       output(formatted.text);
-      await trackCommandSucceeded({ command: fullCommand, duration_ms: Date.now() - startTime, flags: usedFlags, chain });
+      await trackSucceeded({ command: fullCommand, duration_ms: Date.now() - startTime, flags: usedFlags, chain });
       return { type: 'schema', data: result };
     }
 
@@ -1877,7 +2564,7 @@ export async function runCLI(rawArgs, deps = {}) {
     // Alerts list with --table uses custom table format
     if (command === 'alerts' && subcommand === 'list' && table) {
       output(formatAlertsTable(result));
-      await trackCommandSucceeded({ command: fullCommand, duration_ms: Date.now() - startTime, flags: usedFlags, chain });
+      await trackSucceeded({ command: fullCommand, duration_ms: Date.now() - startTime, from_cache: fromCache, flags: usedFlags, chain });
       return { type: 'success', data: result };
     }
 
@@ -1888,26 +2575,32 @@ export async function runCLI(rawArgs, deps = {}) {
       if (streamOutput) {
         output(streamOutput);
       }
-      await trackCommandSucceeded({ command: fullCommand, duration_ms: Date.now() - startTime, from_cache: !!result?.fromCache, flags: usedFlags, chain });
+      await trackSucceeded({ command: fullCommand, duration_ms: Date.now() - startTime, from_cache: fromCache, flags: usedFlags, chain });
       return { type: 'stream', data: result };
     }
 
     const successData = { success: true, data: result };
     const formatted = formatOutput(successData, { pretty, table, csv });
     output(formatted.text);
-    await trackCommandSucceeded({ command: fullCommand, duration_ms: Date.now() - startTime, from_cache: !!result?.fromCache, flags: usedFlags, chain });
+    await trackSucceeded({ command: fullCommand, duration_ms: Date.now() - startTime, from_cache: fromCache, flags: usedFlags, chain });
     return { type: csv ? 'csv' : 'success', data: result };
   } catch (error) {
-    let errorData;
-    if (error instanceof CommandError) {
-      output(error.data ? JSON.stringify(error.data) : error.message);
-      errorData = { error: error.message, code: error.code };
+    // Unified error envelope across all command families (perp/bridge/trade):
+    // every failure serializes through formatError as
+    // {success:false, error, code, status, details}. A CommandError's structured
+    // data (e.g. PASSWORD_REQUIRED resolution steps) is preserved under `details`,
+    // so agents get one consistent shape to branch on regardless of command.
+    const errorData = formatError(error);
+    if (error.reported) {
+      // The command already printed its full human-readable failure output;
+      // emitting the envelope too would produce two output shapes on stdout.
+    } else if (isUsageError(errorData, { pretty, table, csv, stream, isTTY })) {
+      output(errorData.error);
     } else {
-      errorData = formatError(error);
       const formatted = formatOutput(errorData, { pretty, table, csv });
       output(formatted.text);
     }
-    await trackCommandFailed({
+    await trackFailed({
       command: fullCommand,
       duration_ms: Date.now() - startTime,
       error_code: error.code || 'UNKNOWN',

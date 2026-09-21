@@ -6,6 +6,7 @@
 import crypto from 'crypto';
 import { NansenError, ErrorCode, statusToErrorCode, telemetryHeaders, packageVersion } from '../api.js';
 import { getCostForEndpoint } from '../cost-cache.js';
+import { readResponseMeta } from '../response-meta.js';
 
 /**
  * Build standard request headers, matching apiInstance.request() conventions.
@@ -25,7 +26,7 @@ function buildHeaders(apiInstance) {
  * Throw a NansenError with the same structure as apiInstance.request() errors.
  * Includes `details` field for consistency with other commands.
  */
-function throwApiError(message, status, serverDetail) {
+function throwApiError(message, status, serverDetail, errData = null, requestId = null) {
   // Match the friendly wrapper messages from apiInstance.request()
   let friendlyMessage = message;
   if (status === 401) {
@@ -36,9 +37,14 @@ function throwApiError(message, status, serverDetail) {
 
   throw new NansenError(
     friendlyMessage,
-    statusToErrorCode(status),
+    statusToErrorCode(status, errData || {}),
     status,
-    { detail: serverDetail || message, attempt: 1, retryAfterMs: null },
+    {
+      detail: serverDetail || message,
+      attempt: 1,
+      retryAfterMs: null,
+      ...(requestId && { requestId }),
+    },
   );
 }
 
@@ -60,11 +66,52 @@ export async function consumeSSEStream(response, callbacks = {}) {
   const toolCalls = [];
   let conversationId = null;
   let errorPayload = null;
+  let done = false;
 
   const reader = response.body;
   const decoder = new TextDecoder();
   let buffer = '';
 
+  const processFrame = (frame) => {
+    for (const line of frame.split('\n')) {
+      if (!line.startsWith('data:')) continue;
+      // SSE permits `data:value` and `data: value`; discard at most the one
+      // optional space after the colon before parsing the field value.
+      const fieldValue = line.slice(5);
+      const payload = fieldValue.startsWith(' ') ? fieldValue.slice(1) : fieldValue;
+      if (payload === '[DONE]') { done = true; return; }
+
+      let event;
+      try {
+        event = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+
+      switch (event.type) {
+        case 'delta':
+          if (event.text) {
+            chunks.push(event.text);
+            if (onDelta) onDelta(event.text);
+          }
+          break;
+        case 'tool_call':
+          if (event.name) {
+            toolCalls.push(event.name);
+            if (onToolCall) onToolCall(event.name);
+          }
+          break;
+        case 'finish':
+          conversationId = event.conversation_id ?? null;
+          break;
+        case 'error':
+          errorPayload = event;
+          break;
+      }
+    }
+  };
+
+  outer:
   for await (const raw of reader) {
     buffer += decoder.decode(raw, { stream: true });
 
@@ -73,47 +120,19 @@ export async function consumeSSEStream(response, callbacks = {}) {
 
     // SSE: split on double-newline boundaries
     let boundary;
-    let done = false;
     while ((boundary = buffer.indexOf('\n\n')) !== -1) {
       const frame = buffer.slice(0, boundary);
       buffer = buffer.slice(boundary + 2);
-
-      for (const line of frame.split('\n')) {
-        if (!line.startsWith('data: ')) continue;
-        const payload = line.slice(6);
-        if (payload === '[DONE]') { done = true; break; }
-
-        let event;
-        try {
-          event = JSON.parse(payload);
-        } catch {
-          continue;
-        }
-
-        switch (event.type) {
-          case 'delta':
-            if (event.text) {
-              chunks.push(event.text);
-              if (onDelta) onDelta(event.text);
-            }
-            break;
-          case 'tool_call':
-            if (event.name) {
-              toolCalls.push(event.name);
-              if (onToolCall) onToolCall(event.name);
-            }
-            break;
-          case 'finish':
-            conversationId = event.conversation_id ?? null;
-            break;
-          case 'error':
-            errorPayload = event;
-            break;
-        }
-      }
-      if (done) break;
+      processFrame(frame);
+      if (done) break outer;
     }
-    if (done) break;
+  }
+
+  // Flush a trailing unterminated frame (stream closed without \n\n after
+  // the last event, e.g. 'finish' or a final 'delta').
+  if (!done && buffer.trim() !== '') {
+    buffer += decoder.decode(); // flush any pending multi-byte UTF-8 tail
+    processFrame(buffer);
   }
 
   if (errorPayload) {
@@ -248,6 +267,10 @@ EXAMPLES:
       try {
         response = await fetch(url, {
           method: 'POST',
+          // Never follow a redirect on a request carrying the API key — undici
+          // forwards custom credential headers (apikey) across a cross-origin
+          // redirect, handing the key to whatever host the response points at.
+          redirect: 'error',
           headers: buildHeaders(apiInstance),
           body: JSON.stringify(body),
           signal: controller.signal,
@@ -273,24 +296,44 @@ EXAMPLES:
       if (!response.ok) {
         clearTimeout(timer);
         let serverDetail;
+        let errData = null;
         if (response.headers.get('content-type')?.includes('application/json')) {
           try {
-            const errData = await response.json();
+            errData = await response.json();
             serverDetail = errData.detail || errData.message;
           } catch { /* ignore parse failure */ }
         }
+        const meta = readResponseMeta(response);
         throwApiError(
           serverDetail || `Agent returned ${response.status}`,
           response.status,
           serverDetail,
+          errData,
+          meta?.requestId,
         );
       }
+
+      // Abort can also fire while reading the SSE body, not just during
+      // fetch() — wrap that AbortError the same way for a consistent error.
+      const wrapAbortDuringStream = (err) => {
+        if (err.name === 'AbortError') {
+          throw new NansenError(
+            `Request timed out after ${timeoutMs / 1000}s`,
+            ErrorCode.TIMEOUT,
+            504,
+            { detail: `${modeName} mode timeout (${timeoutMs / 1000}s)` },
+          );
+        }
+        throw err;
+      };
 
       // ── JSON mode: buffer everything, return structured data ──
       if (flags.json) {
         let result;
         try {
           result = await consumeSSEStream(response);
+        } catch (err) {
+          return wrapAbortDuringStream(err); // always throws; return makes intent explicit
         } finally {
           clearTimeout(timer);
         }
@@ -319,6 +362,8 @@ EXAMPLES:
             errorLog(`⚙ ${name}`);
           },
         });
+      } catch (err) {
+        return wrapAbortDuringStream(err); // always throws; return makes intent explicit
       } finally {
         clearTimeout(timer);
       }

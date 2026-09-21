@@ -8,6 +8,26 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { EVM_CHAINS } from './chain-ids.js';
 import { getAnonymousId, TELEMETRY_DISABLED } from './telemetry.js';
+import { readResponseMeta, stringHeader } from './response-meta.js';
+
+/**
+ * Key for the credit/rate-limit metadata attached to a successful response.
+ *
+ * A symbol on purpose: JSON.stringify and Object.keys both skip it, so the JSON
+ * every command prints is byte-for-byte unchanged while callers that want the
+ * numbers can still read them off the returned object.
+ */
+export const RESPONSE_META = Symbol('nansenResponseMeta');
+
+/**
+ * Sentinel returned by _x402Retry to mean "this payment option was cleanly
+ * rejected without settlement, safe to try the next option" — distinct from
+ * a genuine successful response whose JSON body happens to be `null`.
+ * Using `null` for both (the previous behavior) made a legitimate null-body
+ * success indistinguishable from a clean rejection, so the caller would sign
+ * and transmit ANOTHER payment for a request that had already succeeded.
+ */
+export const X402_PAYMENT_REJECTED = Symbol('x402PaymentRejected');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -30,6 +50,8 @@ export const ErrorCode = {
   UNAUTHORIZED: 'UNAUTHORIZED',           // 401 - Invalid or missing API key
   FORBIDDEN: 'FORBIDDEN',                 // 403 - Valid key but insufficient permissions
   CREDITS_EXHAUSTED: 'CREDITS_EXHAUSTED', // 403 - Insufficient API credits
+  PLAN_UPGRADE_REQUIRED: 'PLAN_UPGRADE_REQUIRED', // 403 - Feature needs a higher subscription plan
+  GEO_BLOCKED: 'GEO_BLOCKED',             // 451 - Not available in the caller's region
   PAYMENT_REQUIRED: 'PAYMENT_REQUIRED',   // 402 - x402 payment required
   
   // Rate Limiting
@@ -42,11 +64,15 @@ export const ErrorCode = {
   INVALID_PARAMS: 'INVALID_PARAMS',       // Generic parameter validation error
   MISSING_PARAM: 'MISSING_PARAM',         // Required parameter not provided
   UNSUPPORTED_FILTER: 'UNSUPPORTED_FILTER', // Filter not supported for this token/chain
+  QUERY_TOO_LARGE: 'QUERY_TOO_LARGE',     // Query would return too much data - narrow it; retrying will not help
+  PAYLOAD_TOO_LARGE: 'PAYLOAD_TOO_LARGE', // 413 - Request body exceeds the size limit
   
   // Resource Errors
   NOT_FOUND: 'NOT_FOUND',                 // 404 - Resource not found
   TOKEN_NOT_FOUND: 'TOKEN_NOT_FOUND',     // Token doesn't exist
   ADDRESS_NOT_FOUND: 'ADDRESS_NOT_FOUND', // Address has no data
+  METHOD_NOT_ALLOWED: 'METHOD_NOT_ALLOWED', // 405 - HTTP method not allowed for this endpoint
+  CONFLICT: 'CONFLICT',                   // 409 - Request conflicts with the current state
   
   // Server Errors
   SERVER_ERROR: 'SERVER_ERROR',           // 500+ - Nansen API internal error
@@ -55,6 +81,7 @@ export const ErrorCode = {
   // Client Errors
   NETWORK_ERROR: 'NETWORK_ERROR',         // Connection failed
   TIMEOUT: 'TIMEOUT',                     // Request timed out
+  PAYMENT_AMBIGUOUS: 'PAYMENT_AMBIGUOUS', // x402 payment outcome unknown after transmission — do not retry with another payment
   
   // Generic
   UNKNOWN: 'UNKNOWN',                     // Unclassified error
@@ -75,8 +102,8 @@ export const ErrorCode = {
  * parse (e.g. PASSWORD_REQUIRED, API_KEY_REQUIRED).
  */
 export class CommandError extends Error {
-  constructor(message, code = 'COMMAND_ERROR', data = null) {
-    super(message);
+  constructor(message, code = 'COMMAND_ERROR', data = null, options = undefined) {
+    super(message, options); // options.cause keeps the originating error attached
     this.name = 'CommandError';
     this.code = code;
     this.data = data;
@@ -106,12 +133,73 @@ export class NansenError extends Error {
 }
 
 /**
- * Map HTTP status codes to error codes
+ * Stable snake_case codes the API sends in error bodies, mapped to the
+ * ErrorCode values downstream consumers already key on.
+ *
+ * Every code documented at
+ * https://docs.nansen.ai/getting-started/error-handling has an entry here, so
+ * friendly messages and agent-facing hints engage for each of them. A code
+ * missing from this map passes through statusToErrorCode verbatim; keep the
+ * table in step with that page when the API adds a code.
+ */
+export const SERVER_CODE_MAP = {
+  // Request validation (400 / 422)
+  missing_field: ErrorCode.MISSING_PARAM,
+  unknown_field: ErrorCode.INVALID_PARAMS,
+  invalid_field_value: ErrorCode.INVALID_PARAMS,
+  invalid_address_format: ErrorCode.INVALID_ADDRESS,
+  invalid_date_format: ErrorCode.INVALID_PARAMS,
+  invalid_date_range: ErrorCode.INVALID_PARAMS,
+  mutually_exclusive_fields: ErrorCode.INVALID_PARAMS,
+  value_out_of_range: ErrorCode.INVALID_PARAMS,
+  too_many_items: ErrorCode.INVALID_PARAMS,
+  // Authentication, authorization, quota
+  unauthenticated: ErrorCode.UNAUTHORIZED,
+  forbidden: ErrorCode.FORBIDDEN,
+  geo_blocked: ErrorCode.GEO_BLOCKED,
+  plan_upgrade_required: ErrorCode.PLAN_UPGRADE_REQUIRED,
+  insufficient_credits: ErrorCode.CREDITS_EXHAUSTED,
+  rate_limit_exceeded: ErrorCode.RATE_LIMITED,
+  // Resource and request shape
+  not_found: ErrorCode.NOT_FOUND,
+  method_not_allowed: ErrorCode.METHOD_NOT_ALLOWED,
+  conflict: ErrorCode.CONFLICT,
+  payload_too_large: ErrorCode.PAYLOAD_TOO_LARGE,
+  // Server side
+  query_timeout: ErrorCode.TIMEOUT,
+  query_too_large: ErrorCode.QUERY_TOO_LARGE,
+  upstream_unavailable: ErrorCode.SERVICE_UNAVAILABLE,
+  internal_error: ErrorCode.SERVER_ERROR,
+  // Aliases from earlier error-body shapes, kept so older responses still map.
+  unauthorized: ErrorCode.UNAUTHORIZED,
+  payment_required: ErrorCode.PAYMENT_REQUIRED,
+  unsupported_filter: ErrorCode.UNSUPPORTED_FILTER,
+  validation_error: ErrorCode.INVALID_PARAMS,
+  invalid_params: ErrorCode.INVALID_PARAMS,
+};
+
+/**
+ * Map an error response to an error code.
+ *
+ * Order matters: a 402 is always PAYMENT_REQUIRED (the x402 auto-payment flow
+ * keys on it, whatever the body says); then a stable `code` field from the
+ * server body wins over prose matching — known codes map onto the ErrorCode
+ * enum, unknown ones pass through verbatim so new server codes are tolerated,
+ * never flattened; bodies without a code fall back to status + prose.
  */
 export function statusToErrorCode(status, data = {}) {
+  if (status === 402) return ErrorCode.PAYMENT_REQUIRED;
+
+  const rawCode = [data?.code, data?.detail?.code]
+    .find(value => typeof value === 'string' && value.trim() !== '');
+  if (rawCode !== undefined) {
+    const serverCode = rawCode.trim();
+    return SERVER_CODE_MAP[serverCode] ?? serverCode;
+  }
+
   const message = data?.message || data?.error || '';
   const messageLower = message.toLowerCase();
-  
+
   switch (status) {
     case 400:
     case 422:
@@ -131,8 +219,18 @@ export function statusToErrorCode(status, data = {}) {
       if (messageLower.includes('token')) return ErrorCode.TOKEN_NOT_FOUND;
       if (messageLower.includes('address') || messageLower.includes('wallet')) return ErrorCode.ADDRESS_NOT_FOUND;
       return ErrorCode.NOT_FOUND;
+    case 405:
+      return ErrorCode.METHOD_NOT_ALLOWED;
+    case 408:
+      return ErrorCode.TIMEOUT;
+    case 409:
+      return ErrorCode.CONFLICT;
+    case 413:
+      return ErrorCode.PAYLOAD_TOO_LARGE;
     case 429:
       return ErrorCode.RATE_LIMITED;
+    case 451:
+      return ErrorCode.GEO_BLOCKED;
     case 500:
     case 502:
       return ErrorCode.SERVER_ERROR;
@@ -194,19 +292,53 @@ const DEFAULT_CACHE_TTL = 300; // 5 minutes
 
 import crypto from 'crypto';
 
-/**
- * Generate cache key from endpoint and request body
- */
-function getCacheKey(endpoint, body) {
-  const data = JSON.stringify({ endpoint, body });
-  return crypto.createHash('md5').update(data).digest('hex');
+const AUTH_HEADER_NAMES = ['apikey', 'authorization', 'payment-signature'];
+
+// payment-signature is intentionally included: it is an auth credential and
+// including it isolates caches between users with different static signatures.
+// This is safe because:
+// (a) User-supplied signatures (--x402-payment-signature) live in defaultHeaders
+//     and are stable across calls, keeping the identity hash stable.
+// (b) Auto-generated signatures from the x402 retry path are added inside
+//     _x402Retry(), which calls fetch() directly and never goes through the
+//     cache check — so they never appear in options.headers here.
+// INVARIANT: do not place a freshly-generated per-request Payment-Signature in
+// options.headers before calling request() — it would produce a unique identity
+// hash on every call and silently disable caching for those requests.
+export function computeIdentityDigest(apiKey, ...headerSets) {
+  const authHeaders = {};
+  for (const headers of headerSets) {
+    if (!headers) continue;
+    for (const [name, value] of Object.entries(headers)) {
+      const lower = name.toLowerCase();
+      if (AUTH_HEADER_NAMES.includes(lower)) authHeaders[lower] = value;
+    }
+  }
+  const material = JSON.stringify({
+    apiKey: apiKey ?? null,
+    authHeaders: Object.fromEntries(
+      Object.entries(authHeaders).sort(([a], [b]) => a.localeCompare(b))
+    ),
+  });
+  return crypto.createHash('sha256').update(material).digest('hex');
+}
+
+function getCacheKey(endpoint, body, context = {}) {
+  const data = JSON.stringify({
+    endpoint,
+    body,
+    baseUrl: context.baseUrl ?? null,
+    method: context.method ?? null,
+    identity: context.identity ?? null,
+  });
+  return crypto.createHash('sha256').update(data).digest('hex');
 }
 
 /**
  * Get cached response if valid
  */
-export function getCachedResponse(endpoint, body, ttlSeconds = DEFAULT_CACHE_TTL) {
-  const cacheKey = getCacheKey(endpoint, body);
+export function getCachedResponse(endpoint, body, ttlSeconds = DEFAULT_CACHE_TTL, context = {}) {
+  const cacheKey = getCacheKey(endpoint, body, context);
   const cacheFile = path.join(CACHE_DIR, `${cacheKey}.json`);
   
   if (!fs.existsSync(cacheFile)) {
@@ -223,7 +355,22 @@ export function getCachedResponse(endpoint, body, ttlSeconds = DEFAULT_CACHE_TTL
       return null;
     }
     
-    return { ...cached.data, _meta: { ...cached.data._meta, fromCache: true, cacheAge: Math.round(age) } };
+    // Re-attach the cache marker without reshaping the payload. Object-spreading
+    // a top-level array turns it into { 0: …, 1: … }, so a cached array came back
+    // as an object and every Array.isArray() branch downstream (the table/CSV/
+    // markdown formatters in cli.js, alertsGet) stopped recognising it — the first
+    // call rendered rows and the second rendered nothing. Arrays therefore get
+    // _meta hung off the array itself, exactly as the live request path does when
+    // it records retriedAttempts, and primitives are handed back untouched
+    // because a non-object cannot carry the marker at all.
+    const meta = { ...cached.data?._meta, fromCache: true, cacheAge: Math.round(age) };
+    if (Array.isArray(cached.data)) {
+      const rows = cached.data.slice();
+      rows._meta = meta;
+      return rows;
+    }
+    if (cached.data === null || typeof cached.data !== 'object') return cached.data;
+    return { ...cached.data, _meta: meta };
   } catch (_e) {
     // Invalid cache file, delete it
     try { fs.unlinkSync(cacheFile); } catch { /* ignore */ }
@@ -234,12 +381,12 @@ export function getCachedResponse(endpoint, body, ttlSeconds = DEFAULT_CACHE_TTL
 /**
  * Save response to cache
  */
-export function setCachedResponse(endpoint, body, data) {
+export function setCachedResponse(endpoint, body, data, context = {}) {
   if (!fs.existsSync(CACHE_DIR)) {
     fs.mkdirSync(CACHE_DIR, { mode: 0o700, recursive: true });
   }
-  
-  const cacheKey = getCacheKey(endpoint, body);
+
+  const cacheKey = getCacheKey(endpoint, body, context);
   const cacheFile = path.join(CACHE_DIR, `${cacheKey}.json`);
   
   const cached = {
@@ -284,6 +431,79 @@ const ADDRESS_PATTERNS = {
   // Bitcoin: Various formats
   bitcoin: /^(1|3|bc1)[a-zA-HJ-NP-Z0-9]{25,62}$/,
 };
+
+// Server-side limits on the batch counterparties endpoint. Checked client-side so
+// an over-limit request fails with an actionable message instead of a 422.
+export const COUNTERPARTIES_BATCH_MAX_ADDRESSES = 10;
+export const COUNTERPARTIES_BATCH_MAX_DAYS = 90;
+
+/**
+ * Chains the batch counterparties endpoint accepts: the upstream `ProfilerChain`
+ * enum from https://api.nansen.ai/openapi.json, which is what the request model
+ * validates `chain` against. Anything outside it is a 422.
+ *
+ * Deliberately NOT derived from EVM_CHAINS. That list is this CLI's own
+ * address-format/ENS set and omits every non-EVM chain the endpoint does serve
+ * (bitcoin, tron, sui, ton, near, ...).
+ * Mirrors ADDRESS_COUNTERPARTIES_BATCH_CHAINS on the MCP side (nansen-ra#3550),
+ * which additionally drops `arc` and `starknet`; the spec enum is the contract
+ * here, so they stay in.
+ */
+export const COUNTERPARTIES_BATCH_CHAINS = [
+  'all', 'arbitrum', 'arc', 'avalanche', 'base', 'bitcoin', 'bnb', 'ethereum',
+  'hyperevm', 'injective', 'iotaevm', 'linea', 'mantle', 'mantra', 'monad',
+  'near', 'optimism', 'plasma', 'polygon', 'robinhood', 'sei', 'solana',
+  'sonic', 'starknet', 'sui', 'ton', 'tron',
+];
+
+/**
+ * A token that is at least shaped like an address: 3-128 chars, no whitespace,
+ * alphanumerics plus the separators bech32/NEAR/TON addresses use.
+ *
+ * COUNTERPARTIES_BATCH_CHAINS admits chains whose address format validateAddress
+ * has no pattern for (arc, injective, mantra, near, robinhood, starknet, sui,
+ * ton, tron), where it falls through to its permissive "any non-empty string"
+ * branch. Accepting those chains must not turn a newline `--file` into a way to
+ * post arbitrary lines as `wallet_addresses`, so this is the floor; the API does
+ * the real per-chain check. Every valid EVM, Solana and Bitcoin address already
+ * satisfies it, so it never fires on a chain that was strictly validated.
+ */
+const ADDRESS_SHAPED = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
+
+/**
+ * TON's raw address form: a workchain id, ":", then 64 hex characters —
+ * `0:` for the basechain, `-1:` for the masterchain. Both the ":" and the
+ * leading "-" fail ADDRESS_SHAPED, so raw TON addresses were rejected with a
+ * misleading error even though the endpoint serves them. Matched exactly here
+ * rather than by adding ":" to ADDRESS_SHAPED, which would put a separator no
+ * other supported chain uses back into the floor for every chain. Friendly
+ * (base64url) TON addresses already clear ADDRESS_SHAPED.
+ */
+const TON_RAW_ADDRESS = /^-?\d{1,10}:[0-9a-fA-F]{64}$/;
+
+/** Whether an address clears the shape floor for `chain`. */
+function isAddressShaped(address, chain) {
+  if (ADDRESS_SHAPED.test(address)) return true;
+  return chain === 'ton' && TON_RAW_ADDRESS.test(address);
+}
+
+/**
+ * Resolve a caller-supplied chain to the spelling the batch endpoint accepts,
+ * or throw. `bsc` is the common spelling and the one the API echoes back in
+ * responses, but the request enum only knows `bnb` — normalise rather than
+ * reject, matching the MCP tool.
+ */
+function resolveCounterpartiesBatchChain(chain) {
+  const lowered = String(chain ?? '').trim().toLowerCase();
+  const resolved = lowered === 'bsc' ? 'bnb' : lowered;
+  if (!COUNTERPARTIES_BATCH_CHAINS.includes(resolved)) {
+    throw new NansenError(
+      `Unsupported chain "${chain}" for batch counterparties. Supported chains: ${COUNTERPARTIES_BATCH_CHAINS.join(', ')}.`,
+      ErrorCode.INVALID_PARAMS
+    );
+  }
+  return resolved;
+}
 
 /**
  * Validate address format for a given chain
@@ -341,7 +561,7 @@ export function validateTokenAddress(tokenAddress, chain = 'solana') {
  */
 function requireValidAddress(address, chain) {
   const v = validateAddress(address, chain);
-  if (!v.valid) throw new NansenError(v.error, v.code);
+  if (!v.valid) throw new NansenError(`Invalid address "${address}" for chain "${chain}": ${v.error}`, v.code);
 }
 
 /**
@@ -352,7 +572,21 @@ function requireValidToken(tokenAddress, chain) {
   if (!v.valid) throw new NansenError(v.error, v.code);
 }
 
-function loadConfig() {
+/**
+ * Which ecosystem chain 'all' would route this address to, or throw if neither.
+ * validateAddress's unknown-chain branch accepts any non-empty string for 'all',
+ * so classify against the concrete formats instead.
+ */
+function classifyAutoDetectedAddress(address) {
+  if (validateAddress(address, 'ethereum').valid) return 'EVM';
+  if (validateAddress(address, 'solana').valid) return 'Solana';
+  throw new NansenError(
+    `Invalid address format: "${address}". With chain "all" every address must be a valid EVM address (0x followed by 40 hex characters) or Solana address (Base58, 32-44 chars).`,
+    ErrorCode.INVALID_ADDRESS
+  );
+}
+
+export function loadConfig() {
   // Base config from files, then env vars override individual fields
   let config = null;
 
@@ -399,6 +633,28 @@ const DEFAULT_RETRY_OPTIONS = {
   maxDelayMs: 30000,
   retryOnStatus: [429, 500, 502, 503, 504],
 };
+
+/**
+ * Read a response body once. A fetch body can only be consumed once, and
+ * response.json() consumes it even when parsing fails, so a body the server
+ * declares as non-JSON (gateway HTML, plain text) is read as text first. It
+ * is still parsed as JSON when it turns out to be JSON; otherwise the thrown
+ * error carries the text so the caller can report it.
+ */
+async function readBody(response) {
+  const contentType = stringHeader(response, 'content-type');
+  if (contentType && !/json/i.test(contentType)) {
+    const rawBody = await response.text();
+    try {
+      return JSON.parse(rawBody);
+    } catch (_err) {
+      const error = new Error('Response body is not JSON');
+      error.rawBody = rawBody;
+      throw error;
+    }
+  }
+  return response.json();
+}
 
 /**
  * Sleep for a given number of milliseconds
@@ -465,6 +721,28 @@ export class NansenAPI {
       ttl: options.cache?.ttl ?? DEFAULT_CACHE_TTL
     };
     this.defaultHeaders = options.defaultHeaders || {};
+    /**
+     * Credit/rate-limit metadata from the most recent response, or null.
+     *
+     * Survives any reshaping a command handler does to the response body, which
+     * the RESPONSE_META symbol on the returned object does not. Last write wins
+     * when a handler makes several calls — the freshest balance, which is what a
+     * low-credit warning wants.
+     */
+    this.lastResponseMeta = null;
+    /** API path of the most recent request(), for pairing lastResponseMeta with a cost estimate. */
+    this.lastEndpoint = null;
+    /**
+     * Whether the most recent request() was answered from the local response
+     * cache instead of the network.
+     *
+     * Lives on the instance for the same reason lastResponseMeta does: a cache
+     * hit returns early, and a handler that rebuilds its result (alerts list,
+     * for one) drops the `_meta.fromCache` marker carried on the body, so the
+     * payload alone can't be trusted to still say so by the time telemetry
+     * reads it. Last write wins when a handler makes several calls.
+     */
+    this.servedFromCache = false;
   }
 
   static cleanBody(body) {
@@ -478,7 +756,14 @@ export class NansenAPI {
 
   /**
    * Retry a POST request with a payment signature.
-   * Returns parsed JSON if the paid request succeeds, or null if still rejected.
+   * Returns parsed JSON if the paid request succeeds, or the X402_PAYMENT_REJECTED
+   * sentinel if the server cleanly, legibly rejected it without settling.
+   * Throws a NansenError(PAYMENT_AMBIGUOUS) — instead of returning the sentinel —
+   * for any outcome that doesn't prove the payment was rejected: a transport
+   * failure after transmission, an HTTP 5xx, or a response body that can't be
+   * parsed. In all of those cases the server may already have received and
+   * settled the payment, so the caller must not treat it as safe to retry with
+   * a different option — that would risk paying twice for the same request.
    * Logs the payment and warns about low balance when walletLabel and network are given.
    *
    * @param {string} signature - Payment-Signature header value
@@ -486,28 +771,64 @@ export class NansenAPI {
    * @param {string|null} network - x402 network string for balance check, e.g. "eip155:8453"
    * @param {string} url - Request URL
    * @param {object} body - Request body (will be cleaned)
-   * @param {object} [options={}] - Request options (may include .headers)
-   * @returns {Promise<object|null>} Parsed JSON on success, null if rejected
+   * @param {object} [options={}] - Request options (may include .method, .headers)
+   * @returns {Promise<object|typeof X402_PAYMENT_REJECTED>}
    *
    * TODO: full fix — extract the entire x402 provider dispatch from request() into
    * an attemptX402Payment() method so adding a new payment provider only requires
    * touching that one method, not hunting inside the retry loop.
    */
   async _x402Retry(signature, walletLabel, network, url, body, options = {}, asset = null) {
-    const paidResponse = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Client-Type': 'nansen-cli',
-        'X-Client-Version': packageVersion,
-        ...telemetryHeaders(),
-        'Payment-Signature': signature,
-        ...this.defaultHeaders,
-        ...options.headers,
-      },
-      body: JSON.stringify(NansenAPI.cleanBody(body)),
-    });
-    if (!paidResponse.ok) return null;
+    // Mirror request(): paid retries must use the original method. Hardcoding
+    // POST burned a payment signature then hit the wrong route for GET/DELETE/PATCH.
+    const method = options.method || 'POST';
+    const isGet = method === 'GET';
+    let paidResponse;
+    try {
+      paidResponse = await fetch(url, {
+        method,
+        redirect: 'error',
+        headers: {
+          ...(!isGet && { 'Content-Type': 'application/json' }),
+          'X-Client-Type': 'nansen-cli',
+          'X-Client-Version': packageVersion,
+          ...telemetryHeaders(),
+          'Payment-Signature': signature,
+          ...this.defaultHeaders,
+          ...options.headers,
+        },
+        ...(!isGet && method !== 'DELETE' && { body: JSON.stringify(NansenAPI.cleanBody(body)) }),
+      });
+    } catch (err) {
+      // The signature was already on the wire when the connection failed —
+      // the server may have received and settled it before we lost the
+      // response. Fail closed rather than let the caller sign and send a
+      // second payment for the same logical request.
+      throw new NansenError(
+        `x402 payment outcome unknown: request failed after the signed payment was transmitted (${err.message}). Not attempting another payment for the same request.`,
+        ErrorCode.PAYMENT_AMBIGUOUS,
+      );
+    }
+    if (!paidResponse.ok) {
+      // A 5xx doesn't prove the payment was rejected — the server could have
+      // processed it before failing to respond. Only a readable non-5xx
+      // rejection body is safe to treat as "try the next option".
+      if (paidResponse.status >= 500) {
+        throw new NansenError(
+          `x402 payment outcome unknown: server returned ${paidResponse.status} after the signed payment was transmitted. Not attempting another payment for the same request.`,
+          ErrorCode.PAYMENT_AMBIGUOUS,
+        );
+      }
+      try {
+        await paidResponse.json();
+      } catch (err) {
+        throw new NansenError(
+          `x402 payment outcome unknown: rejection response body was unreadable (${err.message}). Not attempting another payment for the same request.`,
+          ErrorCode.PAYMENT_AMBIGUOUS,
+        );
+      }
+      return X402_PAYMENT_REJECTED;
+    }
     if (walletLabel) {
       console.error(`[x402] Paid via ${walletLabel}${network ? ` (${network})` : ''}`);
     }
@@ -520,10 +841,26 @@ export class NansenAPI {
         }
       } catch { /* balance check is best-effort */ }
     }
-    return await paidResponse.json();
+    let data;
+    try {
+      data = await paidResponse.json();
+    } catch (err) {
+      // The payment was accepted (2xx) — it settled. We just can't read the
+      // response body, so surface that plainly rather than silently treating
+      // it as a rejection and paying again.
+      throw new NansenError(
+        `x402 payment succeeded but its response body was unreadable (${err.message}). The payment was not repeated.`,
+        ErrorCode.PAYMENT_AMBIGUOUS,
+      );
+    }
+    const meta = readResponseMeta(paidResponse);
+    this.lastResponseMeta = meta;
+    if (meta && data !== null && typeof data === 'object') data[RESPONSE_META] = meta;
+    return data;
   }
 
   async request(endpoint, body = {}, options = {}) {
+    this.lastEndpoint = endpoint;
     const url = `${this.baseUrl}${endpoint}`;
     const { maxRetries, baseDelayMs, maxDelayMs, retryOnStatus } = this.retryOptions;
     const shouldRetry = options.retry !== false; // Allow disabling retry per-request
@@ -531,23 +868,37 @@ export class NansenAPI {
     // Check cache first (if enabled and not bypassed)
     const useCache = options.cache !== false && this.cacheOptions.enabled;
     const cacheTtl = options.cacheTtl ?? this.cacheOptions.ttl;
-    
-    if (useCache) {
-      const cached = getCachedResponse(endpoint, body, cacheTtl);
+    const method = options.method || 'POST';
+    // Defer identity hashing to keep the uncached (default) path free of crypto work.
+    // cacheContext is therefore null unless caching is on; the `&& cacheContext`
+    // guards below ensure that null never reaches getCacheKey, where a missing
+    // identity would silently produce a credential-agnostic (shared) cache key.
+    const cacheContext = useCache
+      ? {
+          baseUrl: this.baseUrl,
+          method,
+          identity: computeIdentityDigest(this.apiKey, this.defaultHeaders, options.headers),
+        }
+      : null;
+
+    if (useCache && cacheContext) {
+      const cached = getCachedResponse(endpoint, body, cacheTtl, cacheContext);
       if (cached) {
+        this.servedFromCache = true;
         return cached;
       }
     }
+    this.servedFromCache = false;
 
     let lastError;
-    
+
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       let response;
       try {
-        const method = options.method || 'POST';
         const isGet = method === 'GET';
         response = await fetch(url, {
           method,
+          redirect: 'error',
           headers: {
             ...(!isGet && { 'Content-Type': 'application/json' }),
             'X-Client-Type': 'nansen-cli',
@@ -578,18 +929,31 @@ export class NansenAPI {
 
       let data;
       try {
-        data = await response.json();
-      } catch (_err) {
+        data = await readBody(response);
+      } catch (err) {
         // Non-JSON response (rare, usually server errors)
+        const meta = readResponseMeta(response);
+        this.lastResponseMeta = meta;
+        // readBody already holds the text when the server declared a non-JSON
+        // body; otherwise try to read it now (null once json() consumed it).
+        const rawBody = err?.rawBody ?? await response.text().catch(() => null);
+        const retryAfterMs = parseRetryAfter(stringHeader(response, 'retry-after'));
         const error = new NansenError(
           `Invalid response from API (status ${response.status})`,
-          response.status >= 500 ? ErrorCode.SERVER_ERROR : ErrorCode.UNKNOWN,
+          statusToErrorCode(response.status, {}),
           response.status,
-          { body: await response.text().catch(() => null), attempt: attempt + 1 }
+          {
+            body: rawBody,
+            attempt: attempt + 1,
+            retryAfterMs,
+            ...(meta?.requestId && { requestId: meta.requestId })
+          }
         );
         
-        if (shouldRetry && attempt < maxRetries && response.status >= 500) {
-          const delayMs = calculateBackoff(attempt, baseDelayMs, maxDelayMs);
+        // Same retry policy as a JSON error body: a rate limiter or gateway
+        // that answers in plain text or HTML is still a 429/5xx.
+        if (shouldRetry && attempt < maxRetries && retryOnStatus.includes(response.status)) {
+          const delayMs = calculateBackoff(attempt, baseDelayMs, maxDelayMs, retryAfterMs);
           await sleep(delayMs);
           lastError = error;
           continue;
@@ -603,7 +967,9 @@ export class NansenAPI {
           || `API error: ${response.status}`;
         // nansen-api proxy stringifies nested error dicts via Python str(), producing
         // "{'message': 'actual error', ...}". Extract the inner message if present.
-        const nestedMatch = typeof message === 'string' && message.match(/['"]message['"]\s*:\s*['"](.*?)['"]/);
+        // Require the closing quote to be followed by a comma or closing brace so
+        // an apostrophe inside the message (e.g. "can't") doesn't truncate it.
+        const nestedMatch = typeof message === 'string' && message.match(/['"]message['"]\s*:\s*['"](.*?)['"]\s*[,}]/s);
         if (nestedMatch) message = nestedMatch[1];
         const code = statusToErrorCode(response.status, data);
         const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'));
@@ -641,9 +1007,14 @@ export class NansenAPI {
                 const { createPrivyPaymentSignatures } = await import('./privy.js');
                 for await (const { signature, network } of createPrivyPaymentSignatures(response, url)) {
                   const result = await this._x402Retry(signature, `Privy wallet ${defaultWalletName}`, network, url, body, options);
-                  if (result !== null) return result;
+                  if (result !== X402_PAYMENT_REJECTED) return result;
                 }
               } catch (privyErr) {
+                // An ambiguous outcome (transport failure, 5xx, unreadable body)
+                // after a signed payment was already transmitted must not be
+                // treated as an ordinary payment failure — there is no other
+                // provider to fall back to here, and retrying could double-pay.
+                if (privyErr instanceof NansenError && privyErr.code === ErrorCode.PAYMENT_AMBIGUOUS) throw privyErr;
                 message = `x402 Privy payment failed: ${privyErr.message}`;
               }
             } else {
@@ -653,10 +1024,17 @@ export class NansenAPI {
                 const { createPaymentSignatures } = await import('./x402.js');
                 for await (const { signature, network, asset } of createPaymentSignatures(response, url)) {
                   const result = await this._x402Retry(signature, `local wallet ${defaultWalletName}`, network, url, body, options, asset);
-                  if (result !== null) return result;
-                  // This payment option was rejected, try next
+                  if (result !== X402_PAYMENT_REJECTED) return result;
+                  // This payment option was cleanly rejected without settling, try next
                 }
-              } catch { /* local wallet unavailable, try WalletConnect */ }
+              } catch (localErr) {
+                // An ambiguous outcome here means a signed payment may already
+                // be in flight or settled server-side. Do NOT fall through to
+                // WalletConnect below — that would sign and transmit a second,
+                // independent payment authorization for the same request.
+                if (localErr instanceof NansenError && localErr.code === ErrorCode.PAYMENT_AMBIGUOUS) throw localErr;
+                /* local wallet unavailable for any other reason, try WalletConnect */
+              }
 
               // 2. Fall back to WalletConnect (walletconnect-x402.js)
               {
@@ -678,11 +1056,16 @@ export class NansenAPI {
                     const { handleX402Payment } = await import('./walletconnect-x402.js');
                     const paymentSignature = await handleX402Payment(paymentRequirements);
                     const result = await this._x402Retry(paymentSignature, 'WalletConnect', null, url, body, options);
-                    if (result !== null) return result;
+                    if (result !== X402_PAYMENT_REJECTED) return result;
                   } catch (x402Err) {
+                    // WalletConnect is the last resort in this chain — an
+                    // ambiguous outcome here still must not be reported as an
+                    // ordinary "payment failed" that invites the caller to
+                    // retry the whole request (and sign yet another payment).
+                    if (x402Err instanceof NansenError && x402Err.code === ErrorCode.PAYMENT_AMBIGUOUS) throw x402Err;
                     if (!this.apiKey) {
                       message = 'No API key configured. Three ways to authenticate:\n' +
-                        '  1. API key: nansen login --api-key <key> (get key at https://app.nansen.ai/auth/agent-setup)\n' +
+                        '  1. API key: run `nansen login --human` or set NANSEN_API_KEY (get key at https://app.nansen.ai/auth/agent-setup)\n' +
                         '  2. x402 micropayment: nansen wallet create + fund with USDC on Base/Solana or USDT0 on X Layer (no API key needed)\n' +
                         '  3. MPP via tempo: install tempo CLI, run `tempo wallet login`, then call the API with `tempo request` (see skills/nansen-mpp-payment)';
                     } else {
@@ -702,10 +1085,23 @@ export class NansenAPI {
           }
         }
 
+        // Quota state and the request id belong on the error above all: an
+        // out-of-credits or rate-limited failure is exactly when the caller
+        // needs the numbers, and a 5xx is worthless to support without the id.
+        // formatError() surfaces details, so this needs no plumbing.
+        //
+        // On a retried call this is the LAST attempt's id — each attempt gets
+        // its own server-side id, and the last one is the failure worth
+        // reporting.
+        const meta = readResponseMeta(response);
+        this.lastResponseMeta = meta;
         lastError = new NansenError(message, code, response.status, {
           ...data,
           attempt: attempt + 1,
-          retryAfterMs
+          retryAfterMs,
+          ...(meta?.requestId && { requestId: meta.requestId }),
+          ...(meta?.credits && { credits: meta.credits }),
+          ...(meta?.rateLimit && { rateLimit: meta.rateLimit })
         });
         
         // Retry on specific status codes
@@ -722,12 +1118,21 @@ export class NansenAPI {
       if (attempt > 0) {
         data._meta = { ...(data._meta || {}), retriedAttempts: attempt };
       }
-      
+
       // Cache successful response
-      if (useCache) {
-        setCachedResponse(endpoint, body, data);
+      if (useCache && cacheContext) {
+        setCachedResponse(endpoint, body, data, cacheContext);
       }
-      
+
+      // Attach after caching so the cache stores the payload alone — quota
+      // numbers are per-response and would be stale on a cache hit.
+      // Guarded: a response body can be a primitive, which cannot take a property.
+      const meta = readResponseMeta(response);
+      this.lastResponseMeta = meta;
+      if (meta) {
+        if (data !== null && typeof data === 'object') data[RESPONSE_META] = meta;
+      }
+
       return data;
     }
     
@@ -739,6 +1144,16 @@ export class NansenAPI {
 
   async getAccount() {
     return this.request('/api/v1/account', {}, { method: 'GET', cache: false });
+  }
+
+  // ============= Chain Endpoints =============
+
+  async chainRank(params = {}) {
+    const { timeFrame = 7, chainType = 'all' } = params;
+    return this.request('/api/v1/chains/chain-rank', {
+      time_frame: timeFrame,
+      chain_type: chainType
+    });
   }
 
   // ============= Smart Money Endpoints =============
@@ -803,6 +1218,17 @@ export class NansenAPI {
     });
   }
 
+  async smartMoneyPnlLeaderboard(params = {}) {
+    const { chains = ['solana'], timeframe = 7, filters = {}, orderBy, pagination } = params;
+    return this.request('/api/v1/smart-money/pnl-leaderboard', {
+      chains,
+      timeframe,
+      filters,
+      order_by: orderBy,
+      pagination
+    });
+  }
+
   // ============= Profiler Endpoints =============
 
   async addressBalance(params = {}) {
@@ -821,8 +1247,19 @@ export class NansenAPI {
   async addressLabels(params = {}) {
     const { address, chain = 'ethereum', pagination = { page: 1, per_page: 100 } } = params;
     if (address) requireValidAddress(address, chain);
-    return this.request('/api/beta/profiler/address/labels', {
-      parameters: { address, chain },
+    return this.request('/api/v1/profiler/address/labels', {
+      address,
+      chain,
+      pagination
+    });
+  }
+
+  async addressPremiumLabels(params = {}) {
+    const { address, chain = 'all', pagination = { page: 1, per_page: 100 } } = params;
+    if (address) requireValidAddress(address, chain);
+    return this.request('/api/v1/profiler/address/premium-labels', {
+      address,
+      chain,
       pagination
     });
   }
@@ -876,6 +1313,10 @@ export class NansenAPI {
     return this.request('/api/v1/search/general', body);
   }
 
+  async tokenSectors() {
+    return this.request('/api/v1/search/token-sectors', {}, { method: 'GET' });
+  }
+
   async webSearch(params = {}) {
     const { queries, numResults = 10 } = params;
     if (!queries || queries.length === 0) {
@@ -925,6 +1366,17 @@ export class NansenAPI {
     });
   }
 
+  async addressFirstFunder(params = {}) {
+    const { address } = params;
+    // EVM addresses only; the funder is resolved across chains server-side, so
+    // chain is fixed to 'all' and the endpoint forbids any extra fields.
+    if (address) requireValidAddress(address, 'ethereum');
+    return this.request('/api/v1/profiler/address/first-funder', {
+      address,
+      chain: 'all'
+    });
+  }
+
   async addressCounterparties(params = {}) {
     const { address, chain = 'ethereum', filters = {}, orderBy, pagination, days = 30 } = params;
     if (address) requireValidAddress(address, chain);
@@ -932,6 +1384,85 @@ export class NansenAPI {
       address,
       chain,
       date: buildDateRange(days),
+      filters,
+      order_by: orderBy,
+      pagination
+    });
+  }
+
+  /**
+   * Batch counterparties for up to 10 distinct wallets in one request.
+   * Results are not aggregated: every row carries the `wallet_address` it belongs to.
+   * Defaults to chain 'all' (the ecosystem is auto-detected), matching the CLI.
+   */
+  async addressCounterpartiesBatch(params = {}) {
+    const { addresses, chain = 'all', filters = {}, orderBy, pagination, days = 30, sourceInput } = params;
+    const resolvedChain = resolveCounterpartiesBatchChain(chain);
+    const list = Array.isArray(addresses) ? addresses : (addresses ? [addresses] : []);
+    // Dedupe on the normalised form, because the server lowercases EVM addresses
+    // before deduping: a checksum-cased repeat must not count twice against the
+    // address limit. Solana (and other case-sensitive) addresses normalise to
+    // themselves. Chain 'all' auto-detects per address, so normalise EVM casing
+    // there too.
+    const normalizeChain = resolvedChain === 'all' ? 'ethereum' : resolvedChain;
+    const walletAddresses = [...new Set(
+      list.map(a => normalizeAddress(String(a).trim(), normalizeChain)).filter(Boolean)
+    )];
+
+    if (walletAddresses.length === 0) {
+      throw new NansenError(
+        'At least one wallet address is required. Pass --addresses "0xabc,0xdef" or --file <path>',
+        ErrorCode.MISSING_PARAM
+      );
+    }
+    if (walletAddresses.length > COUNTERPARTIES_BATCH_MAX_ADDRESSES) {
+      throw new NansenError(
+        `Batch counterparties accepts at most ${COUNTERPARTIES_BATCH_MAX_ADDRESSES} distinct addresses per request, got ${walletAddresses.length}. Split them across several requests.`,
+        ErrorCode.INVALID_PARAMS
+      );
+    }
+    if (!Number.isFinite(days) || days < 1) {
+      throw new NansenError('--days must be a positive number', ErrorCode.INVALID_PARAMS);
+    }
+    if (days > COUNTERPARTIES_BATCH_MAX_DAYS) {
+      throw new NansenError(
+        `Batch counterparties is capped at ${COUNTERPARTIES_BATCH_MAX_DAYS} days, got ${days}. Split the window into several requests, or use the single-wallet counterparties command instead.`,
+        ErrorCode.INVALID_PARAMS
+      );
+    }
+    if (resolvedChain === 'all') {
+      // 'all' routes each address to its own ecosystem, but one request cannot
+      // span both — the server rejects a mixed batch, so fail before sending it.
+      const ecosystems = new Set(walletAddresses.map(classifyAutoDetectedAddress));
+      if (ecosystems.size > 1) {
+        throw new NansenError(
+          "A batch cannot mix EVM and Solana addresses. Query each ecosystem separately; chain='all' auto-detects either ecosystem.",
+          ErrorCode.INVALID_PARAMS
+        );
+      }
+    } else {
+      for (const walletAddress of walletAddresses) {
+        // Strict where this CLI knows the format (EVM, Solana, Bitcoin); a
+        // no-op elsewhere, where the shape floor is all there is.
+        requireValidAddress(walletAddress, resolvedChain);
+        if (!isAddressShaped(walletAddress, resolvedChain)) {
+          const shape = 'an address-shaped token (3-128 characters, letters, digits, ".", "-" or "_")'
+            + (resolvedChain === 'ton'
+              ? ', or a raw TON address (workchain, ":" and 64 hex characters, e.g. "0:" or "-1:")'
+              : '');
+          throw new NansenError(
+            `Invalid address "${walletAddress}" for chain "${resolvedChain}": expected ${shape}. This CLI cannot check ${resolvedChain} address formats, so the API validates the rest.`,
+            ErrorCode.INVALID_ADDRESS
+          );
+        }
+      }
+    }
+
+    return this.request('/api/v1/profiler/address/counterparties/batch', {
+      wallet_addresses: walletAddresses,
+      chain: resolvedChain,
+      date: buildDateRange(days),
+      source_input: sourceInput,
       filters,
       order_by: orderBy,
       pagination
@@ -984,6 +1515,25 @@ export class NansenAPI {
       filters,
       order_by: orderBy,
       pagination
+    });
+  }
+
+  async addressPerpPnlSummary(params = {}) {
+    const { address, fromDate, toDate } = params;
+    // HL addresses are EVM-format, so ethereum validation accepts every valid HL address
+    if (address) requireValidAddress(address, 'ethereum');
+    return this.request('/api/v1/profiler/perp-pnl-summary', {
+      address,
+      date: { from: fromDate, to: toDate }
+    });
+  }
+
+  async transactionWithTokenTransferLookup(params = {}) {
+    const { chain = 'ethereum', transactionHash, blockTimestamp } = params;
+    return this.request('/api/v1/transaction-with-token-transfer-lookup', {
+      chain,
+      transaction_hash: transactionHash,
+      block_timestamp: blockTimestamp
     });
   }
 
@@ -1132,6 +1682,13 @@ export class NansenAPI {
       filters,
       order_by: orderBy,
       pagination
+    });
+  }
+
+  async tokenPositionIntelligence(params = {}) {
+    const { tokenAddress } = params;
+    return this.request('/api/v1/tgm/position-intelligence', {
+      token_address: tokenAddress
     });
   }
 
@@ -1363,16 +1920,6 @@ export class NansenAPI {
     });
   }
 
-  // ============= Points Endpoints =============
-
-  async pointsLeaderboard(params = {}) {
-    const { tier, pagination } = params;
-    return this.request('/api/v1/points/leaderboard', {
-      tier,
-      pagination
-    });
-  }
-
   // ============= Portfolio Endpoints =============
 
   async portfolioDefiHoldings(params = {}) {
@@ -1527,6 +2074,29 @@ export class NansenAPI {
     });
   }
 
+  async researchHistoricalTokenOhlcv(params = {}) {
+    const { chain = 'solana', tokenAddress, fromDate, asOfDate, asOfTs, timeframe, applyBlacklistFilter } = params;
+    if (tokenAddress) requireValidToken(tokenAddress, chain);
+    if (!fromDate) {
+      throw new NansenError('fromDate is required', ErrorCode.MISSING_PARAM);
+    }
+    if (asOfDate && asOfTs) {
+      throw new NansenError('asOfDate and asOfTs are mutually exclusive', ErrorCode.INVALID_PARAMS);
+    }
+    if (!asOfDate && !asOfTs) {
+      throw new NansenError('One of asOfDate or asOfTs is required', ErrorCode.MISSING_PARAM);
+    }
+    return this.request('/api/v1beta1/tgm/historical-token-ohlcv', {
+      chain,
+      token_address: tokenAddress,
+      date_from: fromDate,
+      as_of_date: asOfDate,
+      as_of_ts: asOfTs,
+      timeframe,
+      apply_blacklist_filter: applyBlacklistFilter
+    });
+  }
+
   // ============= Smart Alert Endpoints =============
 
   async alertsList(params = {}) {
@@ -1536,15 +2106,17 @@ export class NansenAPI {
   }
 
   async alertsCreate(params = {}) {
-    return this.request('/api/v1/smart-alert', params);
+    // Creating an alert is non-idempotent: a lost response after a committed
+    // create must not trigger another request through the generic retry loop.
+    return this.request('/api/v1/smart-alert', params, { cache: false, retry: false });
   }
 
   async alertsUpdate(params = {}) {
-    return this.request('/api/v1/smart-alert', params, { method: 'PATCH' });
+    return this.request('/api/v1/smart-alert', params, { method: 'PATCH', cache: false });
   }
 
   async alertsToggle(params = {}) {
-    return this.request('/api/v1/smart-alert/toggle', params, { method: 'PATCH' });
+    return this.request('/api/v1/smart-alert/toggle', params, { method: 'PATCH', cache: false });
   }
 
   async alertsGet(id) {
@@ -1556,7 +2128,7 @@ export class NansenAPI {
   }
 
   async alertsDelete(alertId) {
-    return this.request(`/api/v1/smart-alert/${encodeURIComponent(alertId)}`, {}, { method: 'DELETE' });
+    return this.request(`/api/v1/smart-alert/${encodeURIComponent(alertId)}`, {}, { method: 'DELETE', cache: false });
   }
 }
 

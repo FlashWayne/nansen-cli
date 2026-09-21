@@ -49,7 +49,10 @@ function validateSolanaAddress(address) {
 // ============= Amount Parsing =============
 
 function parseAmount(amountStr, decimals) {
-  const parts = amountStr.split('.');
+  const str = String(amountStr).trim();
+  if (str.startsWith('-')) throw new Error('Amount must be positive');
+  if (!/^\d+(\.\d+)?$/.test(str)) throw new Error('Amount must be a valid number');
+  const parts = str.split('.');
   const whole = parts[0] || '0';
   let frac = (parts[1] || '').padEnd(decimals, '0').slice(0, decimals);
   return BigInt(whole) * (10n ** BigInt(decimals)) + BigInt(frac);
@@ -113,16 +116,39 @@ function bigIntToHex(n) {
 // ============= EVM Transaction =============
 
 async function buildEvmTransaction({ to, amount, token, privateKey, chain, max = false }) {
+  const chainId = CHAIN_IDS[chain];
+  if (!chainId) throw new Error(`Unsupported chain: ${chain} (no chain ID configured for EVM transfers)`);
   const rpcUrl = CHAIN_RPCS[chain] || CHAIN_RPCS.evm;
-  const chainId = CHAIN_IDS[chain] || 1;
 
   // Derive address and buffer for signing
   const privBuf = Buffer.from(privateKey, 'hex');
   const from = deriveEvmAddress(privateKey);
 
-  // Nonce
-  const nonceHex = await rpcCall(rpcUrl, 'eth_getTransactionCount', [from, 'latest']);
-  const nonce = BigInt(nonceHex);
+  // Fetch both pending and latest nonce counts. 'pending' is used so mempool-
+  // queued transactions are counted — 'latest' alone would assign the same
+  // nonce to back-to-back sends, causing one to fail or silently replace the
+  // other. The gap check mirrors trading.js's getEvmNonce: if more than 2
+  // transactions are already queued, signing another would silently stack
+  // behind them and sit unexecutable until they clear or get replaced.
+  const MAX_PENDING_NONCE_GAP = 2;
+  const [pendingHex, latestHex] = await Promise.all([
+    rpcCall(rpcUrl, 'eth_getTransactionCount', [from, 'pending']),
+    rpcCall(rpcUrl, 'eth_getTransactionCount', [from, 'latest']),
+  ]);
+  const nonce = BigInt(pendingHex);
+  const latestNonce = BigInt(latestHex);
+  const gap = Number(nonce - latestNonce);
+  if (gap > MAX_PENDING_NONCE_GAP) {
+    // wallet send has no --nonce/--priority-fee, so don't tell the user to
+    // replace via this CLI. Also note the two-RPC race on load-balanced
+    // endpoints (same caveat as trading.js getEvmNonce).
+    throw new Error(
+      `${from} has ${gap} unmined transactions queued on ${chain} (next mined nonce ${latestNonce}, next pending ${nonce}). ` +
+      `Signing another would queue behind them and stay unexecutable until they clear. ` +
+      `Wait for them to clear (or replace them with a higher fee from where they were sent) before retrying. ` +
+      `Note that a load-balanced public RPC may report a transaction it isn't actually holding, so don't diagnose from a single endpoint.`,
+    );
+  }
 
   // Fees — dynamic priority fee
   const feeHistory = await rpcCall(rpcUrl, 'eth_feeHistory', [4, 'latest', [50]]);
@@ -804,11 +830,16 @@ export async function sendTokens({ to, amount, chain, token = null, wallet = nul
  * Send tokens via WalletConnect (EVM only).
  */
 async function sendTokensViaWalletConnect({ to, amount, chain, token, max, dryRun }) {
+  const chainId = CHAIN_IDS[chain];
+  if (!chainId) throw new Error(`Unsupported chain: ${chain} (no chain ID configured for EVM transfers)`);
   const rpcUrl = CHAIN_RPCS[chain] || CHAIN_RPCS.evm;
-  const chainId = CHAIN_IDS[chain] || 1;
 
-  const wcAddress = await getWalletConnectAddress();
-  if (!wcAddress) throw new Error('No WalletConnect session active. Run: walletconnect connect');
+  // Scoped to this specific chain, not just "any EVM account" — a session
+  // approved only for a different chain must not be used to sign a transfer
+  // on this one (addresses are identical across EVM chains, so an address
+  // match alone can't catch this; the CAIP-2 chain tag can).
+  const wcAddress = await getWalletConnectAddress('evm', chainId);
+  if (!wcAddress) throw new Error(`No WalletConnect session active for chain "${chain}" (eip155:${chainId}). Run: walletconnect connect`);
 
   let txTo, txValue, txData;
 
@@ -926,7 +957,6 @@ function getExplorerUrl(chain, txHash) {
     bnb: 'https://bscscan.com/tx/',
     avalanche: 'https://snowtrace.io/tx/',
     linea: 'https://lineascan.build/tx/',
-    scroll: 'https://scrollscan.com/tx/',
     mantle: 'https://mantlescan.xyz/tx/',
   };
   const base = explorers[chain] || explorers.ethereum;

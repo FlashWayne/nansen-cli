@@ -92,6 +92,28 @@ describe('Amount Parsing', () => {
     expect(parseAmount('1.123456789', 6)).toBe(1123456n);
   });
 
+  test('rejects negative amounts', () => {
+    expect(() => parseAmount('-1.5', 6)).toThrow('Amount must be positive');
+    expect(() => parseAmount('-0.1', 18)).toThrow('Amount must be positive');
+  });
+
+  test('rejects negative amounts with surrounding whitespace', () => {
+    expect(() => parseAmount(' -1.5', 6)).toThrow('Amount must be positive');
+    expect(() => parseAmount('-1.5 ', 6)).toThrow('Amount must be positive');
+  });
+
+  test('rejects non-numeric and malformed amounts', () => {
+    expect(() => parseAmount('abc', 6)).toThrow('Amount must be a valid number');
+    expect(() => parseAmount('', 6)).toThrow('Amount must be a valid number');
+    expect(() => parseAmount('1.2.3', 6)).toThrow('Amount must be a valid number');
+    expect(() => parseAmount('1.', 6)).toThrow('Amount must be a valid number');
+    expect(() => parseAmount('.5', 6)).toThrow('Amount must be a valid number');
+  });
+
+  test('trims surrounding whitespace on valid amounts', () => {
+    expect(parseAmount(' 1.5 ', 6)).toBe(1500000n);
+  });
+
   test('pads short decimals', () => {
     expect(parseAmount('1.1', 18)).toBe(1100000000000000000n);
   });
@@ -335,6 +357,36 @@ describe('sendTokens integration', () => {
       expect(result.token).toBeNull();
     });
 
+    test('fetches nonce with both "pending" and "latest" for gap check', async () => {
+      mockEvmRpcSmart();
+      await sendTokens({ to: '0x742d35Cc6bF4F3f4e0e3a8DD7e37ff4e4Be4E4B4', amount: '0.01', chain: 'evm', password: 'test' });
+      const nonceCalls = fetch.mock.calls
+        .map(([, opts]) => JSON.parse(opts.body))
+        .filter(b => b.method === 'eth_getTransactionCount');
+      const tags = nonceCalls.map(b => b.params[1]);
+      expect(tags).toContain('pending');
+      expect(tags).toContain('latest');
+    });
+
+    test('rejects when too many transactions are already queued (stuck nonce guard)', async () => {
+      fetch.mockImplementation(async (url, opts) => {
+        const body = JSON.parse(opts.body);
+        if (body.method === 'eth_getTransactionCount') {
+          // pending = 5, latest = 2 → gap of 3 > MAX_PENDING_NONCE_GAP (2)
+          return { json: () => Promise.resolve({ result: body.params[1] === 'pending' ? '0x5' : '0x2' }) };
+        }
+        return { json: () => Promise.resolve({ result: '0x0' }) };
+      });
+      await expect(
+        sendTokens({ to: '0x742d35Cc6bF4F3f4e0e3a8DD7e37ff4e4Be4E4B4', amount: '0.01', chain: 'evm', password: 'test' }),
+      ).rejects.toThrow(
+        /unmined transactions queued[\s\S]*Wait for them to clear[\s\S]*load-balanced public RPC/,
+      );
+      await expect(
+        sendTokens({ to: '0x742d35Cc6bF4F3f4e0e3a8DD7e37ff4e4Be4E4B4', amount: '0.01', chain: 'evm', password: 'test' }),
+      ).rejects.not.toThrow(/Replace the stuck transaction|--nonce|--priority-fee/);
+    });
+
     test('sends on Base chain', async () => {
       mockEvmRpcSmart();
       const result = await sendTokens({ to: '0x742d35Cc6bF4F3f4e0e3a8DD7e37ff4e4Be4E4B4', amount: '0.01', chain: 'base', password: 'test' });
@@ -542,6 +594,47 @@ describe('sendTokens via WalletConnect', () => {
       to: '0x742d35Cc6bF4F3f4e0e3a8DD7e37ff4e4Be4E4B4',
       amount: '0.1',
       chain: 'evm',
+      walletconnect: true,
+    })).rejects.toThrow('No WalletConnect session active');
+
+    vi.restoreAllMocks();
+  });
+
+  test('scopes the WalletConnect address lookup to the target chain, not just any EVM account', async () => {
+    const addrSpy = vi.spyOn(wcTrading, 'getWalletConnectAddress').mockResolvedValue('0x742d35Cc6bF4F3f4e0e3a8DD7e37ff4e4Be4E4B4');
+    vi.spyOn(wcTrading, 'sendTransactionViaWalletConnect').mockResolvedValue({ txHash: '0xmocktx123' });
+    fetch.mockImplementation(async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      const r = { 'eth_getTransactionReceipt': { status: '0x1', blockNumber: '0x100' } };
+      return { json: () => Promise.resolve({ result: r[body.method] || '0x0' }) };
+    });
+
+    await sendTokens({
+      to: '0x742d35Cc6bF4F3f4e0e3a8DD7e37ff4e4Be4E4B4',
+      amount: '0.1',
+      chain: 'base',
+      walletconnect: true,
+    });
+
+    expect(addrSpy).toHaveBeenCalledWith('evm', 8453);
+    vi.restoreAllMocks();
+  });
+
+  test('rejects when the WalletConnect session is connected but not to the target chain (regression)', async () => {
+    // Before the fix: getWalletConnectAddress() took no chain argument at all
+    // and returned any eip155:* account, so a session approved only for a
+    // different chain would silently be used to sign a transfer meant for
+    // this one -- EVM addresses are identical across chains, so nothing
+    // downstream could have caught the mismatch.
+    vi.spyOn(wcTrading, 'getWalletConnectAddress').mockImplementation(async (chainType, chainId) => {
+      // Session is connected, but only approved for Ethereum mainnet (1), not Base (8453).
+      return chainId === 1 ? '0x742d35Cc6bF4F3f4e0e3a8DD7e37ff4e4Be4E4B4' : null;
+    });
+
+    await expect(sendTokens({
+      to: '0x742d35Cc6bF4F3f4e0e3a8DD7e37ff4e4Be4E4B4',
+      amount: '0.1',
+      chain: 'base',
       walletconnect: true,
     })).rejects.toThrow('No WalletConnect session active');
 

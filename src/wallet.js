@@ -3,6 +3,7 @@
  * Local key generation and storage for EVM and Solana chains.
  */
 
+import { rejectBlankOption } from './query-options.js';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -281,27 +282,32 @@ function hashPassword(password) {
 
 // ============= Prompt Helper =============
 
-async function promptPassword(question, deps = {}) {
+// Exported for testing (mirrors the exported `prompt` in cli.js). The streams
+// are injectable so the masking behavior can be exercised without a real TTY.
+export async function promptPassword(question, deps = {}, { input: inStream = process.stdin, output: outStream = process.stderr } = {}) {
   const promptFn = deps.promptFn;
   if (promptFn) {
     return promptFn(question, true);
   }
   // Fallback to readline (only available in --human mode)
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
-    if (process.stdout.isTTY) {
-      process.stdout.write(question);
+    // Gate on stdin, not stdout: raw-mode masking disables the terminal's own
+    // echo, so a redirected stdout (e.g. `wallet export > backup.json`) can no
+    // longer fall through to readline and echo the password in cleartext. Prompt
+    // and mask characters go to stderr so they stay on the terminal and never
+    // pollute — or leak into — a redirected stdout.
+    if (inStream.isTTY) {
+      outStream.write(question);
       let input = '';
-      process.stdin.setRawMode(true);
-      process.stdin.resume();
-      process.stdin.setEncoding('utf8');
+      inStream.setRawMode(true);
+      inStream.resume();
+      inStream.setEncoding('utf8');
       const onData = (char) => {
         if (char === '\n' || char === '\r') {
-          process.stdin.setRawMode(false);
-          process.stdin.pause();
-          process.stdin.removeListener('data', onData);
-          process.stdout.write('\n');
-          rl.close();
+          inStream.setRawMode(false);
+          inStream.pause();
+          inStream.removeListener('data', onData);
+          outStream.write('\n');
           resolve(input);
         } else if (char === '\u0003') {
           process.exit();
@@ -309,11 +315,12 @@ async function promptPassword(question, deps = {}) {
           input = input.slice(0, -1);
         } else {
           input += char;
-          process.stdout.write('*');
+          outStream.write('*');
         }
       };
-      process.stdin.on('data', onData);
+      inStream.on('data', onData);
     } else {
+      const rl = readline.createInterface({ input: inStream, output: outStream });
       rl.question(question, (answer) => { rl.close(); resolve(answer); });
     }
   });
@@ -574,6 +581,25 @@ export async function deleteWallet(name, password) {
 // ============= CLI Command Builder =============
 
 /**
+ * Every `nansen wallet` subcommand the dispatcher below accepts, in the order
+ * they are advertised to users. `help` is deliberately absent: it is the
+ * fallback, not a capability. The top-level help banner builds its wallet line
+ * from this list, and command-surface.test.js checks the handlers, README and
+ * src/schema.json against it so the four cannot drift apart.
+ */
+export const WALLET_SUBCOMMANDS = [
+  'create',
+  'list',
+  'show',
+  'export',
+  'default',
+  'delete',
+  'send',
+  'forget-password',
+  'secure',
+];
+
+/**
  * Build wallet command handlers for integration into CLI.
  */
 export function buildWalletCommands(deps = {}) {
@@ -582,6 +608,7 @@ export function buildWalletCommands(deps = {}) {
   return {
     'wallet': async (args, apiInstance, flags, options) => {
       const subcommand = args[0] || 'help';
+      if (subcommand === 'create') rejectBlankOption(options.name, 'name', '<name>');
 
       // Privy-specific: only 'create' and policy commands need --provider privy
       if (options.provider === 'privy' || process.env.NANSEN_WALLET_PROVIDER === 'privy') {
@@ -751,7 +778,45 @@ export function buildWalletCommands(deps = {}) {
         'export': async () => {
           const name = options.name || args[1];
           if (!name) {
-            throw new CommandError('Usage: nansen wallet export <name>', 'MISSING_ARGS');
+            throw new CommandError('Usage: nansen wallet export <name> [--reveal | --file <path>]', 'MISSING_ARGS');
+          }
+
+          // Bare `--file` parses as flags.file, a repeated or JSON-array `--file`
+          // arrives as a non-string, and `--file ""` (an unset shell variable) is
+          // an empty path that would only fail at open time — reject all of them
+          // before any secret is decrypted.
+          const wantsFile = options.file !== undefined || flags.file;
+          if (wantsFile && (typeof options.file !== 'string' || options.file === '')) {
+            throw new CommandError('--file requires a path: nansen wallet export <name> --file <path>', 'INVALID_INPUT');
+          }
+          if (wantsFile && flags.reveal) {
+            throw new CommandError('Choose one of --reveal or --file <path>, not both.', 'INVALID_INPUT');
+          }
+
+          // Default: redacted. No decryption, no password — secrets never
+          // materialize unless the caller explicitly asked for them.
+          if (!flags.reveal && !wantsFile) {
+            try {
+              const result = showWallet(name);
+              if (result.provider !== 'local') {
+                throw new Error(`${result.provider} wallets don't support key export. Keys are managed by the provider.`);
+              }
+              log(`\n  Wallet "${result.name}" — private keys are NOT shown by default.\n`);
+              log(`  EVM:`);
+              log(`    Address:     ${result.evm}`);
+              log(`    Private Key: [REDACTED]`);
+              log(`  Solana:`);
+              log(`    Address:     ${result.solana}`);
+              log(`    Private Key: [REDACTED]`);
+              log('');
+              log('  To export the private keys:');
+              log(`    nansen wallet export ${result.name} --file <path>   safer: writes a file only you can read (0600)`);
+              log(`    nansen wallet export ${result.name} --reveal        prints them in plaintext to stdout`);
+              log('');
+              return;
+            } catch (err) {
+              throw new CommandError(`❌ ${err.message}`, 'EXPORT_FAILED');
+            }
           }
 
           const config = getWalletConfig();
@@ -761,6 +826,69 @@ export function buildWalletCommands(deps = {}) {
           }
           try {
             const result = exportWallet(name, password);
+
+            if (wantsFile) {
+              // Exclusive create first, write second: unlink-on-failure below
+              // is only safe on a file THIS invocation created — a blind 'wx'
+              // writeFileSync can fail (e.g. EMFILE) without telling us whether
+              // the path pre-existed. Failures are thrown as CommandErrors with
+              // purpose-specific codes (FILE_EXISTS / FILE_WRITE_FAILED) so agents
+              // branch on the code instead of the message; the raw fs error
+              // (key-free, but noisy) stays attached as `cause`, out of the envelope.
+              let fd;
+              try {
+                fd = fs.openSync(options.file, 'wx', 0o600);
+              } catch (err) {
+                if (err.code === 'EEXIST' || err.code === 'EISDIR') {
+                  // Linux reports an existing directory (or symlink) as EEXIST; macOS
+                  // can report a directory as EISDIR. Both mean "already there", so
+                  // neither advises deleting it.
+                  throw new CommandError(`Path already exists: ${options.file} — refusing to overwrite. Choose a path that does not exist yet.`, 'FILE_EXISTS', null, { cause: err });
+                }
+                throw new CommandError(`Could not create ${options.file} (${err.code || 'open failed'}). Nothing was written.`, 'FILE_WRITE_FAILED', null, { cause: err });
+              }
+              // Linear lifecycle: pin the mode, exactly one write attempt,
+              // exactly one close attempt (a failed closeSync may still have
+              // released the fd, so it is never retried), then a single
+              // failure gate.
+              let ioErr = null;
+              try {
+                // The 0o600 passed to openSync is filtered through the process
+                // umask (a 0277 umask leaves 0400), so pin the final mode on
+                // the fd we own. Runs before any key bytes land, so a failure
+                // here takes the same unlink path as a failed write.
+                fs.fchmodSync(fd, 0o600);
+                fs.writeFileSync(fd, JSON.stringify(result, null, 2) + '\n');
+              } catch (err) {
+                ioErr = err;
+              }
+              try {
+                fs.closeSync(fd);
+              } catch (err) {
+                ioErr = ioErr || err;
+              }
+              if (ioErr) {
+                // A failure mid-write or at close (e.g. ENOSPC) can leave a
+                // partial file holding key fragments — remove what we created.
+                let disk = 'Nothing was left on disk.';
+                try {
+                  fs.unlinkSync(options.file);
+                } catch (rmErr) {
+                  if (rmErr.code !== 'ENOENT') {
+                    disk = `A partial file may remain at ${options.file} — delete it manually.`;
+                  }
+                }
+                throw new CommandError(`Could not write ${options.file} (${ioErr.code || 'write failed'}). ${disk}`, 'FILE_WRITE_FAILED', null, { cause: ioErr });
+              }
+              log(`\n✓ Private keys for "${result.name}" written to ${options.file} (permissions 0600).`);
+              log('  Delete the file as soon as the keys are imported elsewhere.');
+              log('');
+              return;
+            }
+
+            if (deps.isTTY ?? process.stdout.isTTY) {
+              process.stderr.write('⚠️  Printing private keys to an interactive terminal. They will remain in your scrollback and may be captured by screen sharing or terminal logging. Prefer --file <path>.\n');
+            }
             log(`\n⚠️  Private keys for "${result.name}" — do not share!\n`);
             log(`  EVM:`);
             log(`    Address:     ${result.evm.address}`);
@@ -771,6 +899,9 @@ export function buildWalletCommands(deps = {}) {
             log('');
             return;
           } catch (err) {
+            // --file failures already carry their own code; only exportWallet
+            // (decrypt / lookup) failures need the generic wrap.
+            if (err instanceof CommandError) throw err;
             throw new CommandError(`❌ ${err.message}`, 'EXPORT_FAILED');
           }
         },
@@ -795,13 +926,15 @@ export function buildWalletCommands(deps = {}) {
             throw new CommandError('Usage: nansen wallet delete <name>', 'MISSING_ARGS');
           }
 
-          // Check if this is a Privy wallet (no password needed)
+          // Check if this is a Privy wallet (no password needed).
+          // getWalletFile() runs validateWalletName(), which rejects any name
+          // outside [a-zA-Z0-9_-]{1,64} — so the path is confined to the wallets
+          // dir and cannot traverse. deleteWallet() re-validates below.
           let isPrivy = false;
           try {
-            const walletFile = path.join(getWalletsDir(), `${name}.json`);
-            const data = JSON.parse(fs.readFileSync(walletFile, 'utf8'));
+            const data = JSON.parse(fs.readFileSync(getWalletFile(name), 'utf8'));
             if (data.provider === 'privy') isPrivy = true;
-          } catch { /* file might not exist, deleteWallet will throw */ }
+          } catch { /* invalid/missing name; deleteWallet will validate and throw */ }
 
           let password = null;
           if (!isPrivy) {
@@ -829,6 +962,8 @@ export function buildWalletCommands(deps = {}) {
         },
 
         'send': async () => {
+          rejectBlankOption(options.token, 'token', '<token-address>');
+          rejectBlankOption(options.wallet, 'wallet', '<name>');
           const { sendTokens } = await import('./transfer.js');
 
           if (!options.to) {
@@ -856,8 +991,10 @@ export function buildWalletCommands(deps = {}) {
             try {
               const walletName = options.wallet || getWalletConfig().defaultWallet;
               if (walletName) {
-                const walletFile = path.join(getWalletsDir(), `${walletName}.json`);
-                const data = JSON.parse(fs.readFileSync(walletFile, 'utf8'));
+                // getWalletFile() runs validateWalletName(), confining the path to
+                // the wallets dir; an invalid name throws and is ignored here, and
+                // the real wallet load downstream validates again.
+                const data = JSON.parse(fs.readFileSync(getWalletFile(walletName), 'utf8'));
                 if (data.provider === 'privy') isPrivyWallet = true;
               }
             } catch { /* ignore */ }
@@ -1005,7 +1142,10 @@ COMMANDS:
                              Create a new wallet pair (EVM + Solana)
   list                       List all wallets
   show <name>                Show wallet addresses
-  export <name>              Export private keys (local wallets only, requires password)
+  export <name> [--reveal | --file <path>]
+                             Export private keys (local wallets only, requires password).
+                             Redacted by default: --reveal prints plaintext to stdout,
+                             --file writes them to a new file only you can read (0600)
   default <name>             Set the default wallet
   delete <name>              Delete a wallet
   send --to <address> --amount <number> --chain <evm|solana> [--token <address>] [--wallet <name>] [--max] [--dry-run]
@@ -1023,6 +1163,8 @@ OPTIONS:
   --token <address>          Token contract/mint address (optional, sends native if omitted)
   --wallet <name>            Wallet to use (optional, uses default if omitted; use "walletconnect" or "wc" for WalletConnect, EVM only)
   --max                      Send entire balance (deducts gas for native transfers)
+  --reveal                   Export: print private keys in plaintext to stdout (explicit acknowledgement)
+  --file <path>              Export: write private keys to <path> (created 0600, refuses to overwrite)
   --unsafe-no-password       Skip encryption — private keys stored UNENCRYPTED on disk (local only)
   --human                    Enable interactive prompts (for human terminal use only)
 
@@ -1039,12 +1181,16 @@ ENVIRONMENT:
   NANSEN_EVM_RPC            Custom Ethereum RPC endpoint (also generic EVM fallback)
   NANSEN_BASE_RPC           Custom Base RPC endpoint
   NANSEN_SOLANA_RPC         Custom Solana RPC endpoint
+  NANSEN_X402_MAX_AMOUNT    Max USD per x402 auto-payment (default 1.00; "unlimited" to disable)
+  NANSEN_X402_ALLOWED_PAYTO Comma-separated recipient allowlist for x402 auto-payment (optional)
 
 EXAMPLES:
   NANSEN_WALLET_PASSWORD=mypass nansen wallet create --name trading
   nansen wallet create --name agent-wallet --provider privy
   nansen wallet list
-  nansen wallet export trading
+  nansen wallet export trading                     # redacted (addresses only)
+  nansen wallet export trading --file backup.json  # keys → 0600 file, nothing on stdout
+  nansen wallet export trading --reveal            # keys → stdout (plaintext)
   nansen wallet default trading
   nansen wallet send --to 0x742d35Cc... --amount 1.5 --chain evm
   nansen wallet send --to 9WzDXw... --amount 0.1 --chain solana --token So11...

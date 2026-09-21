@@ -15,6 +15,7 @@ const DEFAULT_LOG_FILE = path.join(NANSEN_DIR, 'alerts-daemon.log');
 const DEFAULT_STATE_FILE = path.join(NANSEN_DIR, 'alerts-daemon-state.json');
 const STOP_POLL_INTERVAL_MS = 50;
 const STOP_POLL_ATTEMPTS = 100;
+const STARTUP_GRACE_MS = 250;
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]']);
 
 const DAEMON_HELP = `nansen alerts daemon — Listen to Smart Alert events in real-time
@@ -269,6 +270,12 @@ export function buildDaemonCommand(deps = {}) {
           child.unref();
 
           fs.writeFileSync(pidFile, String(child.pid), { mode: 0o600 });
+          fs.chmodSync(pidFile, 0o600);
+          await waitFn(STARTUP_GRACE_MS);
+          if (!isProcessRunning(child.pid, killFn)) {
+            removePidFileIfMatches(pidFile, child.pid);
+            throw new Error(`Daemon exited during startup. Check the log: ${logFile}`);
+          }
 
           log(`Daemon started (PID ${child.pid})`);
           log(`Log: ${logFile}`);

@@ -73,7 +73,9 @@ function keychainRetrieve() {
         '-a', ACCOUNT,
         '-w',
       ], { timeout: TIMEOUT_MS, stdio: ['pipe', 'pipe', 'pipe'] });
-      const pw = result.toString().trim();
+      // Strip only the trailing newline the OS tool appends — trimming all
+      // whitespace would corrupt a password with leading/trailing spaces.
+      const pw = result.toString().replace(/\r?\n$/, '');
       return pw || null;
     }
 
@@ -83,7 +85,9 @@ function keychainRetrieve() {
         'service', SERVICE,
         'account', ACCOUNT,
       ], { timeout: TIMEOUT_MS, stdio: ['pipe', 'pipe', 'pipe'] });
-      const pw = result.toString().trim();
+      // Strip only the trailing newline the OS tool appends — trimming all
+      // whitespace would corrupt a password with leading/trailing spaces.
+      const pw = result.toString().replace(/\r?\n$/, '');
       return pw || null;
     }
 
@@ -147,8 +151,38 @@ function credentialsFileWrite(password) {
       fs.mkdirSync(dir, { mode: 0o700, recursive: true });
     }
     const encoded = Buffer.from(password, 'utf8').toString('base64');
-    fs.writeFileSync(filePath, `NANSEN_WALLET_PASSWORD_B64=${encoded}\n`, { mode: 0o600 });
-    return true;
+    const content = `NANSEN_WALLET_PASSWORD_B64=${encoded}\n`;
+
+    // Windows does not implement POSIX modes or O_NOFOLLOW consistently.
+    if (process.platform === 'win32') {
+      fs.writeFileSync(filePath, content, { mode: 0o600 });
+      return true;
+    }
+
+    let fd;
+    try {
+      const flags = fs.constants.O_WRONLY
+        | fs.constants.O_CREAT
+        | fs.constants.O_NOFOLLOW
+        | fs.constants.O_NONBLOCK;
+      fd = fs.openSync(filePath, flags, 0o600);
+      const stats = fs.fstatSync(fd);
+      if (!stats.isFile()) throw new Error('Credentials path is not a regular file');
+      // O_NOFOLLOW only rejects symlinks. A hard link at .credentials points at
+      // a victim file that is indistinguishable by path or type, so refuse any
+      // regular file with extra links before fchmod/ftruncate touch it.
+      if (stats.nlink !== 1) throw new Error('Credentials file has unexpected hard links');
+
+      // Opening an existing file does not apply the requested mode. Tighten it
+      // before replacing the secret, then enforce the final mode after writing.
+      fs.fchmodSync(fd, 0o600);
+      fs.ftruncateSync(fd, 0);
+      fs.writeFileSync(fd, content, 'utf8');
+      fs.fchmodSync(fd, 0o600);
+      return true;
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
   } catch {
     return false;
   }
@@ -163,6 +197,52 @@ function credentialsFileDelete() {
   } catch {
     return false;
   }
+}
+
+// ============= Metadata-Only Checks =============
+
+function keychainHasEntry() {
+  try {
+    if (process.platform === 'darwin') {
+      // Without -w this prints attributes only — the secret never leaves the keychain
+      execFileSync('/usr/bin/security', [
+        'find-generic-password',
+        '-s', SERVICE,
+        '-a', ACCOUNT,
+      ], { timeout: TIMEOUT_MS, stdio: 'pipe' });
+      return true;
+    }
+
+    if (process.platform === 'linux') {
+      // `search` prints attributes, unlike `lookup` which prints the secret
+      const result = execFileSync('secret-tool', [
+        'search',
+        'service', SERVICE,
+        'account', ACCOUNT,
+      ], { timeout: TIMEOUT_MS, stdio: ['pipe', 'pipe', 'pipe'] });
+      return result.toString().trim().length > 0;
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Where a wallet password is stored, without ever materializing the secret:
+ * env presence, keychain attribute search, and a regex test on the
+ * credentials file (the base64 value is never decoded).
+ * @returns {'env'|'keychain'|'file'|null}
+ */
+export function passwordSource() {
+  if (process.env.NANSEN_WALLET_PASSWORD) return 'env';
+  if (keychainHasEntry()) return 'keychain';
+  try {
+    const content = fs.readFileSync(getCredentialsPath(), 'utf8');
+    if (/^NANSEN_WALLET_PASSWORD(_B64)?=.+$/m.test(content)) return 'file';
+  } catch { /* missing or unreadable */ }
+  return null;
 }
 
 // ============= Public API =============

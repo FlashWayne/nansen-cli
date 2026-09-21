@@ -13,7 +13,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import http from 'http';
 import childProcess from 'child_process';
+import { isNewer } from '../update-check.js';
 
 // We need to test with a controlled cache file, so we'll write to
 // the real ~/.nansen/update-check.json and clean up after.
@@ -51,6 +53,32 @@ function writeCache(data) {
 function removeCache() {
   try { fs.unlinkSync(CACHE_FILE); } catch { /* ignore */ }
 }
+
+// =================== isNewer ===================
+
+describe('isNewer', () => {
+  it('detects a newer full x.y.z version', () => {
+    expect(isNewer('1.44.0', '1.43.9')).toBe(true);
+    expect(isNewer('1.43.9', '1.44.0')).toBe(false);
+    expect(isNewer('1.43.0', '1.43.0')).toBe(false);
+  });
+
+  it('treats a version missing a component as reading .0 for it, not as unreachable (regression)', () => {
+    // Before delegating to the shared compareSemver, isNewer had its own
+    // parser with the identical undefined-vs-number bug that
+    // `nansen changelog --since` had: a version string with fewer than 3
+    // components parsed its missing part as `undefined`, and `>` is always
+    // `false` against `undefined` in both directions — so a partial "latest"
+    // could never register as newer, no matter how new it actually was.
+    expect(isNewer('1.44', '1.43.9')).toBe(true);
+    expect(isNewer('2', '1.99.99')).toBe(true);
+    expect(isNewer('1.43', '1.43.0')).toBe(false);
+  });
+
+  it('ignores a leading "v"', () => {
+    expect(isNewer('v1.44.0', 'v1.43.0')).toBe(true);
+  });
+});
 
 // =================== getUpdateNotification ===================
 
@@ -205,6 +233,126 @@ describe('scheduleUpdateCheck', () => {
     }
     fs.writeFileSync(CACHE_FILE, 'invalid');
     expect(() => scheduleUpdateCheck()).not.toThrow();
+  });
+});
+
+// =================== atomic write (buildCheckScript) ===================
+
+describe('scheduleUpdateCheck atomic write', () => {
+  let buildCheckScript;
+  let tempDir;
+
+  beforeEach(async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-update-atomic-test-'));
+    const mod = await import('../update-check.js');
+    buildCheckScript = mod.buildCheckScript;
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('writes via renameSync from a temp file, never directly to the target', () => {
+    const dir = path.join(tempDir, '.nansen');
+    const file = path.join(dir, 'update-check.json');
+    const script = buildCheckScript(dir, file, 'http://example.invalid/pkg');
+
+    // The payload lands on a temp path first, then is renamed onto the target.
+    expect(script).toContain('renameSync');
+    expect(script).toContain(".tmp'");
+    // The target file is never handed straight to writeFileSync.
+    expect(script).not.toMatch(/writeFileSync\(file\b/);
+    // Temp file is cleaned up if the rename throws.
+    expect(script).toContain('unlinkSync(tmp)');
+  });
+
+  // End-to-end: run the real child script against a local registry and assert
+  // the cache file it produces is complete and valid, with no temp file left.
+  it('produces a complete, parseable cache file with no temp leftover', async () => {
+    const server = http.createServer((_req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ version: '99.0.0' }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+
+    const dir = path.join(tempDir, '.nansen');
+    const file = path.join(dir, 'update-check.json');
+    const script = buildCheckScript(dir, file, `http://127.0.0.1:${port}/nansen-cli/latest`);
+
+    try {
+      await new Promise((resolve, reject) => {
+        const child = childProcess.spawn(process.execPath, ['-e', script], { stdio: 'ignore' });
+        child.on('exit', resolve);
+        child.on('error', reject);
+      });
+
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+      expect(parsed.latest).toBe('99.0.0');
+      expect(typeof parsed.checkedAt).toBe('number');
+
+      const leftovers = fs.readdirSync(dir).filter(f => f.includes('.tmp'));
+      expect(leftovers).toEqual([]);
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+
+  it('does not cache a non-2xx registry response', async () => {
+    const server = http.createServer((_req, res) => {
+      res.statusCode = 500;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ version: '99.0.0', error: 'temporary failure' }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+
+    const dir = path.join(tempDir, '.nansen');
+    const file = path.join(dir, 'update-check.json');
+    const script = buildCheckScript(dir, file, `http://127.0.0.1:${port}/nansen-cli/latest`);
+
+    try {
+      // Exit code guards against a false negative: a child that dies before it
+      // reaches the write also leaves no cache file.
+      const exitCode = await new Promise((resolve, reject) => {
+        const child = childProcess.spawn(process.execPath, ['-e', script], { stdio: 'ignore' });
+        child.on('exit', resolve);
+        child.on('error', reject);
+      });
+
+      expect(exitCode).toBe(0);
+      expect(fs.existsSync(file)).toBe(false);
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+
+  it('does not mark the cache fresh when a 2xx response has no version', async () => {
+    const server = http.createServer((_req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ error: 'missing package metadata' }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+
+    const dir = path.join(tempDir, '.nansen');
+    const file = path.join(dir, 'update-check.json');
+    const script = buildCheckScript(dir, file, `http://127.0.0.1:${port}/nansen-cli/latest`);
+
+    try {
+      // Exit code guards against a false negative: a child that dies before it
+      // reaches the write also leaves no cache file.
+      const exitCode = await new Promise((resolve, reject) => {
+        const child = childProcess.spawn(process.execPath, ['-e', script], { stdio: 'ignore' });
+        child.on('exit', resolve);
+        child.on('error', reject);
+      });
+
+      expect(exitCode).toBe(0);
+      expect(fs.existsSync(file)).toBe(false);
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
   });
 });
 

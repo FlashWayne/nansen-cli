@@ -10,6 +10,7 @@
 
 import { wcExec } from './walletconnect-exec.js';
 import { base58Encode } from './wallet.js';
+import { encodeApproveCalldata } from './trade-validation.js';
 
 const SOLANA_MAINNET_CHAIN = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp';
 
@@ -42,8 +43,19 @@ function parseWcJson(output) {
  *
  * @param {string} [chainType] - Optional: 'evm' or 'solana'. Filters accounts by chain prefix.
  *   No arg = first account (backward compat).
+ * @param {number} [chainId] - Optional, 'evm' only: the specific EIP-155 chain ID the
+ *   caller is about to sign/broadcast on. When given, only an account the session has
+ *   actually approved for THAT chain (`eip155:<chainId>`) is returned — a session
+ *   connected only to, say, Ethereum mainnet must not be handed back as if it were
+ *   approved for Base just because both are "eip155:*". Mirrors the mainnet-only
+ *   exact-match already done for Solana above. Only meaningful for
+ *   chainType === 'evm' -- the Solana branch already does its own exact
+ *   match unconditionally, so omit chainId there (a chain-config chain ID
+ *   like Solana's 501 is not a CAIP-2 EIP-155 chain ID and would not match
+ *   anything); also omit it when no specific chain needs verifying at all
+ *   (chainType itself omitted, for first-account backward compat).
  */
-export async function getWalletConnectAddress(chainType) {
+export async function getWalletConnectAddress(chainType, chainId) {
   try {
     const output = await wcExec('walletconnect', ['whoami', '--json'], 3000);
     const data = JSON.parse(output);
@@ -57,6 +69,10 @@ export async function getWalletConnectAddress(chainType) {
       return solAccount?.address || null;
     }
     if (chainType === 'evm') {
+      if (chainId != null) {
+        const evmAccount = accounts.find(a => a.chain === `eip155:${chainId}`);
+        return evmAccount?.address || null;
+      }
       const evmAccount = accounts.find(a => a.chain?.startsWith('eip155:'));
       return evmAccount?.address || null;
     }
@@ -104,19 +120,24 @@ export async function sendTransactionViaWalletConnect(txData, timeoutMs = 120000
 /**
  * Send an ERC-20 approval via WalletConnect.
  *
- * Builds approve(spender, MAX_UINT256) calldata and delegates to sendTransactionViaWalletConnect.
+ * Builds approve(spender, amount) calldata and delegates to sendTransactionViaWalletConnect.
+ * The amount is scoped to the swap's input (passed by the caller) so a bad quote
+ * can drain at most one trade, not the wallet's full token balance.
  *
  * @param {string} tokenAddress - ERC-20 token contract
  * @param {string} spenderAddress - Approval target (e.g. DEX router)
  * @param {number} chainId - EIP-155 chain ID
+ * @param {bigint|string|number} amount - Allowance to grant, in base units
+ * @param {bigint|string|number} [maxAllowance] - Hard cap from persisted request intent
+ * @param {object} [opts]
+ * @param {boolean} [opts.allowZero=false] - Allow a zero-amount revoke approval
  * @returns {{ txHash?: string, signedTransaction?: string }}
  */
-export async function sendApprovalViaWalletConnect(tokenAddress, spenderAddress, chainId) {
-  // ERC-20 approve(address spender, uint256 amount) selector = 0x095ea7b3
-  const MAX_UINT256_HEX = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
-  const data = '0x095ea7b3'
-    + spenderAddress.slice(2).toLowerCase().padStart(64, '0')
-    + MAX_UINT256_HEX;
+export async function sendApprovalViaWalletConnect(tokenAddress, spenderAddress, chainId, amount, maxAllowance, { allowZero = false } = {}) {
+  // encodeApproveCalldata enforces a valid 20-byte spender, a bounded (< MAX)
+  // amount within the request cap, and exactly-68-byte calldata — so a
+  // malformed or tampered spender/amount can't reshape the ABI word layout.
+  const data = encodeApproveCalldata(spenderAddress, amount, { maxAllowance, allowZero });
 
   return sendTransactionViaWalletConnect({
     to: tokenAddress,

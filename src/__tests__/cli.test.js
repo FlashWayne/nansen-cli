@@ -66,13 +66,56 @@ describe('CLI Smoke Tests', () => {
     expect(stdout).toContain('wallet');
   });
 
+  // Regression for #155: --help on a handler command (quote/execute) used to fall
+  // through to command execution, which errored on missing args and exited 1.
+  it('quote --help exits 0 and shows trade usage', () => {
+    const { stdout, exitCode } = runCLI('quote --help');
+
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('nansen trade');
+    expect(stdout).toContain('quote');
+  });
+
+  it('trade quote --help exits 0', () => {
+    const { exitCode } = runCLI('trade quote --help');
+    expect(exitCode).toBe(0);
+  });
+
+  it('execute --help exits 0', () => {
+    const { exitCode } = runCLI('execute --help');
+    expect(exitCode).toBe(0);
+  });
+
   it('should show schema', () => {
     const { stdout, exitCode } = runCLI('schema');
-    
+
     expect(exitCode).toBe(0);
     const schema = JSON.parse(stdout);
     expect(schema.version).toBeDefined();
     expect(schema.commands).toBeDefined();
+  });
+
+  it('warns on stderr when running a deprecated alias (L3)', () => {
+    // "quote" is deprecated in favour of "trade quote"; running it (even when it
+    // then errors on missing args) should print the notice to stderr.
+    const { stdout, stderr } = runCLI('quote', { env: { NANSEN_API_KEY: 'invalid-key' } });
+    const combined = (stdout || '') + (stderr || '');
+    expect(combined).toContain('"nansen quote" is deprecated');
+    expect(combined).toContain('trade quote');
+  });
+
+  it.each(['points leaderboard', 'research points leaderboard'])('%s fails without suggesting another unavailable command', (command) => {
+    const { stdout, stderr, exitCode } = runCLI(command, {
+      env: { NO_UPDATE_NOTIFIER: '1', NANSEN_NO_TELEMETRY: '1' }
+    });
+
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(stdout)).toMatchObject({
+      success: false,
+      code: 'COMMAND_UNAVAILABLE',
+      error: 'The points leaderboard endpoint has been removed. Run "nansen research" to explore other analytics commands.'
+    });
+    expect(stderr).toBe('');
   });
 
   // =================== JSON Output Format ===================
@@ -219,8 +262,33 @@ describe('CLI Smoke Tests', () => {
 
   it('should handle unknown subcommand gracefully', () => {
     const { stdout } = runCLI('smart-money unknown-subcommand');
-    
+
     const result = JSON.parse(stdout);
     expect(result.data.error).toContain('Unknown subcommand');
+  });
+
+  // Regression: trade-group commands must exit 0 when invoked back-to-back.
+  // A prior report saw intermittent exit 1 here; the real cause was shell
+  // word-splitting in the repro (zsh does not split an unquoted `$var`, so
+  // `node index.js $c` fed "trade --help" as a single unknown-command token).
+  // With correct argv, `trade --help` must reliably exit 0, including in rapid
+  // succession.
+  it('trade --help exits 0 on repeated rapid invocations', () => {
+    for (let i = 0; i < 5; i++) {
+      const { exitCode } = runCLI('trade --help');
+      expect(exitCode).toBe(0);
+    }
+  });
+
+  // A whole command passed as one argument (e.g. `nansen "trade --help"`) is
+  // genuinely unknown and must fail loudly with an actionable shell-quoting
+  // hint, not a silent-looking spurious exit.
+  it('gives an actionable error when a whole command is one argument', () => {
+    const { stdout, exitCode } = runCLI('"trade --help"');
+
+    expect(exitCode).toBe(1);
+    const result = JSON.parse(stdout);
+    expect(result.error).toContain('Unknown command');
+    expect(result.error).toContain('shell quoting');
   });
 });

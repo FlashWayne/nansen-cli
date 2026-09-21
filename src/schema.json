@@ -1,7 +1,429 @@
 {
   "commands": {
+    "perp": {
+      "description": "Hyperliquid perpetual trading commands",
+      "subcommands": {
+        "order": {
+          "submitsTo": "https://api.hyperliquid.xyz/exchange",
+          "apiEndpoints": [
+            "/api/v1/perp/meta",
+            "/api/v1/perp/builder-fee",
+            "/api/v1/sanctions/screen"
+          ],
+          "description": "Place a perp order (limit or market, with optional take-profit/stop-loss)",
+          "options": {
+            "coin": {
+              "type": "string",
+              "required": true,
+              "description": "Asset symbol, e.g. BTC, ETH (alias: --symbol)"
+            },
+            "side": {
+              "type": "string",
+              "required": true,
+              "enum": [
+                "buy",
+                "long",
+                "sell",
+                "short"
+              ],
+              "description": "buy/long opens a long, sell/short opens a short"
+            },
+            "size": {
+              "type": "string",
+              "required": true,
+              "description": "Position size in base asset units"
+            },
+            "price": {
+              "type": "string",
+              "required": true,
+              "description": "Limit price (or mark price for market orders)"
+            },
+            "type": {
+              "type": "string",
+              "default": "limit",
+              "enum": [
+                "limit",
+                "market"
+              ],
+              "description": "Order type"
+            },
+            "tif": {
+              "type": "string",
+              "default": "Gtc",
+              "enum": [
+                "Gtc",
+                "Ioc",
+                "Alo"
+              ],
+              "description": "Time-in-force"
+            },
+            "slippage": {
+              "type": "string",
+              "default": "0.03",
+              "description": "Slippage tolerance for market orders as a decimal in [0,1] (0.03 = 3%)"
+            },
+            "take-profit": {
+              "type": "string",
+              "description": "Take-profit trigger price"
+            },
+            "stop-loss": {
+              "type": "string",
+              "description": "Stop-loss trigger price"
+            },
+            "wallet": {
+              "type": "string",
+              "description": "Wallet name (defaults to the configured default wallet)"
+            }
+          }
+        },
+        "cancel": {
+          "submitsTo": "https://api.hyperliquid.xyz/exchange",
+          "apiEndpoints": [
+            "/api/v1/perp/meta",
+            "/api/v1/sanctions/screen"
+          ],
+          "description": "Cancel an open order by order id",
+          "options": {
+            "coin": {
+              "type": "string",
+              "required": true,
+              "description": "Asset symbol (alias: --symbol)"
+            },
+            "oid": {
+              "type": "string",
+              "required": true,
+              "description": "Order id to cancel"
+            },
+            "wallet": {
+              "type": "string",
+              "description": "Wallet name"
+            }
+          }
+        },
+        "close": {
+          "submitsTo": "https://api.hyperliquid.xyz/exchange",
+          "apiEndpoints": [
+            "/api/v1/perp/positions",
+            "/api/v1/perp/meta",
+            "/api/v1/perp/builder-fee",
+            "/api/v1/sanctions/screen"
+          ],
+          "description": "Close a position (reduce-only market order)",
+          "options": {
+            "coin": {
+              "type": "string",
+              "required": true,
+              "description": "Asset symbol (alias: --symbol)"
+            },
+            "size": {
+              "type": "string",
+              "required": true,
+              "description": "Size to close in base asset units"
+            },
+            "price": {
+              "type": "string",
+              "required": true,
+              "description": "Mark price"
+            },
+            "side": {
+              "type": "string",
+              "required": true,
+              "enum": [
+                "buy",
+                "sell"
+              ],
+              "description": "sell closes a long, buy closes a short"
+            },
+            "slippage": {
+              "type": "string",
+              "default": "0.03",
+              "description": "Slippage tolerance as a decimal in [0,1] (0.03 = 3%)"
+            },
+            "wallet": {
+              "type": "string",
+              "description": "Wallet name"
+            }
+          }
+        },
+        "leverage": {
+          "submitsTo": "https://api.hyperliquid.xyz/exchange",
+          "apiEndpoints": [
+            "/api/v1/perp/meta",
+            "/api/v1/sanctions/screen"
+          ],
+          "description": "Set leverage and margin mode for an asset",
+          "options": {
+            "coin": {
+              "type": "string",
+              "required": true,
+              "description": "Asset symbol (alias: --symbol)"
+            },
+            "leverage": {
+              "type": "string",
+              "required": true,
+              "description": "Leverage multiplier (positive integer, capped at the asset maximum)"
+            },
+            "margin-type": {
+              "type": "string",
+              "default": "cross",
+              "enum": [
+                "cross",
+                "isolated"
+              ],
+              "description": "Margin mode"
+            },
+            "wallet": {
+              "type": "string",
+              "description": "Wallet name"
+            }
+          }
+        },
+        "transfer": {
+          "submitsTo": "https://api.hyperliquid.xyz/exchange",
+          "apiEndpoints": [
+            "/api/v1/sanctions/screen"
+          ],
+          "description": "Move USDC between a wallet's Spot and Perps balances",
+          "options": {
+            "direction": {
+              "type": "string",
+              "required": true,
+              "enum": [
+                "spot-to-perp",
+                "perp-to-spot"
+              ],
+              "description": "Transfer direction"
+            },
+            "amount": {
+              "type": "string",
+              "required": true,
+              "description": "USDC amount to transfer"
+            },
+            "wallet": {
+              "type": "string",
+              "description": "Wallet name (defaults to the configured default wallet)"
+            }
+          }
+        },
+        "approve-builder-fee": {
+          "submitsTo": "https://api.hyperliquid.xyz/exchange",
+          "apiEndpoints": [
+            "/api/v1/perp/builder-fee",
+            "/api/v1/sanctions/screen"
+          ],
+          "description": "Authorize the Nansen builder fee (one-time; auto-fired on the first order/close)",
+          "options": {
+            "wallet": {
+              "type": "string",
+              "description": "Wallet name (defaults to the configured default wallet)"
+            }
+          }
+        },
+        "positions": {
+          "endpoint": "/api/v1/perp/positions",
+          "description": "View open positions",
+          "options": {
+            "wallet": {
+              "type": "string",
+              "description": "Wallet name"
+            }
+          }
+        },
+        "orders": {
+          "endpoint": "/api/v1/perp/orders",
+          "description": "View open/resting orders",
+          "options": {
+            "wallet": {
+              "type": "string",
+              "description": "Wallet name"
+            }
+          }
+        },
+        "account": {
+          "endpoint": "/api/v1/perp/account",
+          "description": "View account state (account value, unrealized PnL, margin, withdrawable)",
+          "options": {
+            "wallet": {
+              "type": "string",
+              "description": "Wallet name"
+            }
+          }
+        },
+        "meta": {
+          "endpoint": "/api/v1/perp/meta",
+          "description": "View available perp assets (id, size decimals, max leverage)",
+          "options": {
+            "filter": {
+              "type": "string",
+              "description": "Filter assets by name substring (also shows the full matching set)"
+            },
+            "all": {
+              "type": "boolean",
+              "description": "Show all assets instead of the first 20"
+            }
+          }
+        }
+      },
+      "notes": "Signed locally and submitted directly to Hyperliquid. apiEndpoints lists the Nansen API routes each command reads (compliance screening, market metadata, builder-fee status)."
+    },
+    "bridge": {
+      "description": "Move funds between Base and Hyperliquid",
+      "notes": "Supported routes: base -> hyperliquid (deposit); hyperliquid -> base, hyperliquid -> ethereum, hyperliquid -> arbitrum (withdrawal). Any other combination is rejected. Deposits broadcast an EVM transaction from the local wallet, so they require a locally signable origin chain; withdrawals sign a Hyperliquid action and never transact on the destination chain.",
+      "routes": [
+        {
+          "origin": "base",
+          "destination": "hyperliquid",
+          "direction": "deposit"
+        },
+        {
+          "origin": "hyperliquid",
+          "destination": "base",
+          "direction": "withdrawal"
+        },
+        {
+          "origin": "hyperliquid",
+          "destination": "ethereum",
+          "direction": "withdrawal"
+        },
+        {
+          "origin": "hyperliquid",
+          "destination": "arbitrum",
+          "direction": "withdrawal"
+        }
+      ],
+      "subcommands": {
+        "quote": {
+          "endpoint": "/api/v1/perp/bridge/quote",
+          "description": "Get a bridge quote and cache it locally for execute (quotes expire after 1 hour)",
+          "options": {
+            "from-chain": {
+              "type": "string",
+              "required": true,
+              "enum": [
+                "base",
+                "hyperliquid"
+              ],
+              "description": "Source chain (alias: --from)"
+            },
+            "to-chain": {
+              "type": "string",
+              "required": true,
+              "enum": [
+                "hyperliquid",
+                "base",
+                "ethereum",
+                "arbitrum"
+              ],
+              "description": "Destination chain (alias: --to)"
+            },
+            "from-token": {
+              "type": "string",
+              "required": true,
+              "description": "Source token symbol (USDC) or address (alias: --token)"
+            },
+            "to-token": {
+              "type": "string",
+              "default": "USDC",
+              "description": "Destination token symbol or address"
+            },
+            "amount": {
+              "type": "string",
+              "required": true,
+              "description": "Amount in base units by default. USDC is 6 decimals on EVM chains but 8 on Hyperliquid, so prefer --amount-unit to avoid the per-chain magnitude trap."
+            },
+            "amount-unit": {
+              "type": "string",
+              "enum": [
+                "token",
+                "usd"
+              ],
+              "description": "Interpret --amount as a human token amount or a USD amount. Omit for base units."
+            },
+            "slippage": {
+              "type": "number",
+              "default": 50,
+              "description": "Slippage in whole basis points, 0-10000 (50 = 0.5%)"
+            },
+            "recipient": {
+              "type": "string",
+              "description": "Destination wallet address (defaults to the signing wallet)"
+            },
+            "wallet": {
+              "type": "string",
+              "description": "Wallet name (defaults to the configured default wallet)"
+            }
+          },
+          "prerequisites": [
+            "A wallet must be configured. Run: nansen wallet create"
+          ]
+        },
+        "execute": {
+          "endpoint": "/api/v1/perp/bridge/execute",
+          "apiEndpoints": [
+            "/api/v1/perp/bridge/execute",
+            "/api/v1/perp/bridge/status",
+            "/api/v1/sanctions/screen"
+          ],
+          "description": "Execute a cached bridge quote. Screens the signing wallet, signs, submits, then polls to completion.",
+          "notes": "The wallet must match the one the quote was created for. A deposit broadcasts its EVM transaction straight to a public RPC rather than through the Nansen API; only the Hyperliquid signature legs are proxied. Quotes are single-use. If a deposit transaction is stuck in the mempool, replace it by requesting a fresh quote and executing it with --nonce set to the stuck nonce and a higher --priority-fee; a replacement must reuse the nonce and outbid the original by roughly 10%.",
+          "options": {
+            "quote": {
+              "type": "string",
+              "required": true,
+              "description": "Quote ID returned by bridge quote"
+            },
+            "wallet": {
+              "type": "string",
+              "description": "Wallet name (defaults to the configured default wallet)"
+            },
+            "priority-fee": {
+              "type": "string",
+              "description": "Priority fee in gwei, overriding the quoted one (EVM deposit legs only)"
+            },
+            "max-fee": {
+              "type": "string",
+              "description": "Fee cap in gwei, overriding the computed one (EVM deposit legs only)"
+            },
+            "nonce": {
+              "type": "string",
+              "description": "Sign at this nonce instead of the next one, to replace a stuck transaction (EVM deposit legs only)"
+            },
+            "dry-run": {
+              "type": "boolean",
+              "description": "Run every sign-free preflight available from the cached quote, its public signer address and read-only RPC calls; print the transfer that would be signed; then stop before wallet credentials and the first signature. Nothing is broadcast, no wallet password is needed, and the quote stays usable. Real execution still resolves and revalidates the live signer. Exits 0."
+            },
+            "yes": {
+              "type": "boolean",
+              "description": "Skip the confirmation prompt (alias: -y, or set NANSEN_YES=1). The prompt is only shown when stdin is an interactive terminal; when stdin is not a terminal (agents, CI, pipes) the command proceeds unprompted whether or not this is passed. Declining the prompt exits 1 with nothing signed."
+            }
+          },
+          "examples": [
+            "nansen bridge execute --quote bridge-1708900000000-abc123",
+            "nansen bridge execute --quote bridge-1708900000000-abc123 --dry-run",
+            "nansen bridge execute --quote bridge-1708900000000-abc123 --yes"
+          ],
+          "prerequisites": [
+            "A wallet must be configured for real execution. Dry-run can use the public signer saved in the cached quote."
+          ]
+        },
+        "status": {
+          "endpoint": "/api/v1/perp/bridge/status",
+          "description": "Check the status of a bridge transfer",
+          "options": {
+            "request-id": {
+              "type": "string",
+              "description": "Bridge request ID (required unless --tx-hash is given)"
+            },
+            "tx-hash": {
+              "type": "string",
+              "description": "Source chain transaction hash (required unless --request-id is given)"
+            }
+          }
+        }
+      }
+    },
     "research": {
-      "description": "Research and analytics commands",
+      "description": "Research and analytics commands. Explicitly blank chain, timeframe, and days options are rejected instead of selecting defaults. Profiler batch rejects blank --delay; trace rejects blank --delay, --depth, and --width.",
       "subcommands": {
         "portfolio": {
           "subcommands": {
@@ -10,7 +432,9 @@
               "description": "DeFi holdings across protocols",
               "options": {
                 "wallet": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Wallet address to fetch DeFi positions for"
                 }
               }
             }
@@ -24,7 +448,9 @@
               "description": "Net capital flows (inflows vs outflows)",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain to query"
                 }
               }
             },
@@ -33,7 +459,9 @@
               "description": "Real-time DEX trading activity",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain to query"
                 }
               }
             },
@@ -50,7 +478,9 @@
               "description": "Aggregated token balances",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain to query"
                 }
               }
             },
@@ -59,10 +489,15 @@
               "description": "Historical holdings over time",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain to query"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 }
               }
             }
@@ -76,13 +511,20 @@
               "description": "Transaction history",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Wallet address to profile"
                 },
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain to profile the address on"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 }
               }
             },
@@ -91,13 +533,20 @@
               "description": "Summarized PnL metrics",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Wallet address to profile"
                 },
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain to profile the address on"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 }
               }
             },
@@ -106,10 +555,14 @@
               "description": "Current token holdings",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Wallet address to profile"
                 },
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain to profile the address on"
                 }
               }
             },
@@ -118,13 +571,45 @@
               "description": "Top counterparties by volume",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Wallet address to profile"
                 },
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain to profile the address on"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
+                }
+              }
+            },
+            "counterparties-batch": {
+              "endpoint": "/api/v1/profiler/address/counterparties/batch",
+              "description": "Top counterparties by volume for up to 10 wallets in one request. Results are not aggregated: every row carries the wallet_address it belongs to, returned as contiguous per-wallet blocks ordered by wallet address — raise --limit and page with --page N to reach later wallets",
+              "options": {
+                "addresses": {
+                  "type": "string",
+                  "description": "Comma-separated list (or JSON array) of up to 10 distinct wallet addresses; required unless --file <path> is provided"
+                },
+                "file": {
+                  "type": "string",
+                  "description": "Read addresses from this file instead of --addresses: a JSON array of addresses, or one address per line"
+                },
+                "chain": {
+                  "type": "string",
+                  "default": "all",
+                  "description": "Chain to profile every address on: all, arbitrum, arc, avalanche, base, bitcoin, bnb, ethereum, hyperevm, injective, iotaevm, linea, mantle, mantra, monad, near, optimism, plasma, polygon, robinhood, sei, solana, sonic, starknet, sui, ton, tron ('bsc' is accepted and sent as 'bnb'). One ecosystem per request: EVM and Solana addresses cannot be mixed. The default 'all' auto-detects the ecosystem across EVM chains, or Solana for a Solana-only batch"
+                },
+                "days": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days (max 90 for this command)"
                 }
               }
             },
@@ -133,13 +618,20 @@
               "description": "Historical balances over time",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Wallet address to profile"
                 },
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain to profile the address on"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 }
               }
             },
@@ -148,10 +640,25 @@
               "description": "Find wallets related to an address",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Wallet address to profile"
                 },
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain to profile the address on"
+                }
+              }
+            },
+            "first-funder": {
+              "endpoint": "/api/v1/profiler/address/first-funder",
+              "description": "Find the first wallet that funded an EVM address",
+              "options": {
+                "address": {
+                  "type": "string",
+                  "required": true,
+                  "description": "Address whose first funder to find"
                 }
               }
             },
@@ -160,13 +667,20 @@
               "description": "PnL and trade performance",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Wallet address to profile"
                 },
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain to profile the address on"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 }
               }
             },
@@ -175,10 +689,14 @@
               "description": "Behavioral and entity labels",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Wallet address to profile"
                 },
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain to profile the address on"
                 }
               }
             },
@@ -187,7 +705,9 @@
               "description": "Current perpetual positions",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Hyperliquid trader address"
                 }
               }
             },
@@ -196,10 +716,15 @@
               "description": "Perpetual trading history",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Hyperliquid trader address"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 }
               }
             },
@@ -208,13 +733,20 @@
               "description": "DEX trade history for a wallet",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Wallet address to profile"
                 },
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain to profile the address on"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 }
               }
             },
@@ -223,7 +755,9 @@
               "description": "Search for entities by name",
               "options": {
                 "query": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Entity or label name to search for"
                 }
               }
             },
@@ -231,13 +765,19 @@
               "description": "Batch profile multiple addresses",
               "options": {
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain to profile every address on"
                 },
                 "include": {
-                  "default": "labels,balance"
+                  "type": "string",
+                  "default": "labels,balance",
+                  "description": "Comma-separated sections to fetch per address: labels, balance, pnl"
                 },
                 "delay": {
-                  "default": 1000
+                  "type": "number",
+                  "default": 1000,
+                  "description": "Delay in milliseconds between API calls"
                 }
               }
             },
@@ -245,22 +785,36 @@
               "description": "Multi-hop counterparty trace (BFS)",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Address to start tracing from"
                 },
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain to profile the address on"
                 },
                 "depth": {
-                  "default": 2
+                  "type": "integer",
+                  "default": 2,
+                  "description": "Hops to follow from the starting address (1-5); valid integers outside the range are clamped"
                 },
                 "width": {
-                  "default": 10
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 10,
+                  "description": "Counterparties to follow at each hop"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days at each hop"
                 },
                 "delay": {
-                  "default": 1000
+                  "type": "number",
+                  "default": 1000,
+                  "description": "Delay in milliseconds between API calls"
                 }
               }
             },
@@ -268,13 +822,20 @@
               "description": "Compare two wallets (shared counterparties, tokens)",
               "options": {
                 "addresses": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Comma-separated list (or JSON array) of wallet addresses to compare"
                 },
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain to compare the wallets on"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 }
               }
             }
@@ -288,13 +849,20 @@
               "description": "Token flow metrics",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain the token lives on"
                 },
                 "token": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Token contract address (mint address on Solana)"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 },
                 "label": {
                   "description": "Holder segment to filter flows by",
@@ -311,16 +879,23 @@
             },
             "who-bought-sold": {
               "endpoint": "/api/v1/tgm/who-bought-sold",
-              "description": "Recent buyers and sellers",
+              "description": "Recent buyers and sellers. Explicitly blank --buy-or-sell values are rejected; omission keeps BUY.",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain the token lives on"
                 },
                 "token": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Token contract address (mint address on Solana)"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 },
                 "buy-or-sell": {
                   "description": "Filter by buy or sell side",
@@ -337,13 +912,20 @@
               "description": "DEX trading activity",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain the token lives on"
                 },
                 "token": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Token contract address (mint address on Solana)"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 }
               }
             },
@@ -352,13 +934,20 @@
               "description": "Token transfer history",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain the token lives on"
                 },
                 "token": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Token contract address (mint address on Solana)"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 }
               }
             },
@@ -367,10 +956,14 @@
               "description": "Token holder analysis",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain the token lives on"
                 },
                 "token": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Token contract address (mint address on Solana)"
                 },
                 "premium-labels": {
                   "description": "Include premium Nansen labels in the response (true=premium, false=free-tier). When omitted, uses API default.",
@@ -383,13 +976,20 @@
               "description": "PnL leaderboard",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain the token lives on"
                 },
                 "token": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Token contract address (mint address on Solana)"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 },
                 "premium-labels": {
                   "description": "Include premium Nansen labels in the response (true=premium, false=free-tier). When omitted, uses API default.",
@@ -402,10 +1002,15 @@
               "description": "Perp PnL leaderboard by token",
               "options": {
                 "symbol": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Perp symbol, e.g. BTC"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 },
                 "premium-labels": {
                   "description": "Include premium Nansen labels in the response (true=premium, false=free-tier). When omitted, uses API default.",
@@ -418,7 +1023,9 @@
               "description": "Open perp positions by token symbol",
               "options": {
                 "symbol": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Perp symbol, e.g. BTC"
                 }
               }
             },
@@ -427,10 +1034,15 @@
               "description": "Perp trades by token symbol",
               "options": {
                 "symbol": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Perp symbol, e.g. BTC"
                 },
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 }
               }
             },
@@ -439,13 +1051,19 @@
               "description": "Detailed flow intelligence by label",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain the token lives on"
                 },
                 "token": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Token contract address (mint address on Solana)"
                 },
                 "timeframe": {
-                  "default": "1d"
+                  "type": "string",
+                  "default": "1d",
+                  "description": "Time window for the flow metrics"
                 }
               }
             },
@@ -454,13 +1072,19 @@
               "description": "Get detailed information for a specific token",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain the token lives on"
                 },
                 "token": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Token contract address (mint address on Solana)"
                 },
                 "timeframe": {
-                  "default": "1d"
+                  "type": "string",
+                  "default": "1d",
+                  "description": "Time window for the price-change and volume fields"
                 }
               }
             },
@@ -469,10 +1093,14 @@
               "description": "Risk and reward indicators for a token (Nansen Score)",
               "options": {
                 "chain": {
-                  "default": "ethereum"
+                  "type": "string",
+                  "default": "ethereum",
+                  "description": "Chain the token lives on"
                 },
                 "token": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Token contract address"
                 }
               }
             },
@@ -481,13 +1109,19 @@
               "description": "OHLCV candle data for a token",
               "options": {
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain the token lives on"
                 },
                 "token": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Token contract address (mint address on Solana)"
                 },
                 "timeframe": {
-                  "default": "1h"
+                  "type": "string",
+                  "default": "1d",
+                  "description": "Candle interval"
                 }
               }
             },
@@ -496,7 +1130,9 @@
               "description": "Jupiter DCA orders for token",
               "options": {
                 "token": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Token mint address"
                 }
               }
             },
@@ -505,10 +1141,14 @@
               "description": "Discover and filter tokens",
               "options": {
                 "timeframe": {
-                  "default": "24h"
+                  "type": "string",
+                  "default": "24h",
+                  "description": "Time window for volume, flow, and price-change metrics"
                 },
                 "chain": {
-                  "default": "solana"
+                  "type": "string",
+                  "default": "solana",
+                  "description": "Chain the token lives on"
                 },
                 "include-stablecoins": {
                   "description": "Whether to include stablecoins in screener results (default true on API side)",
@@ -529,7 +1169,9 @@
                   ]
                 },
                 "limit": {
-                  "default": 25
+                  "type": "number",
+                  "default": 25,
+                  "description": "Number of tokens to return"
                 }
               }
             }
@@ -541,13 +1183,20 @@
           "description": "Search for tokens and entities across Nansen",
           "options": {
             "query": {
-              "required": true
+              "type": "string",
+              "required": true,
+              "description": "Token name, symbol, or address, or an entity name"
             },
             "type": {
-              "default": "any"
+              "type": "string",
+              "default": "any",
+              "enum": ["any", "token", "entity"],
+              "description": "Result type: token, entity, or any"
             },
             "limit": {
-              "default": 25
+              "type": "number",
+              "default": 25,
+              "description": "Maximum number of results"
             }
           }
         },
@@ -558,7 +1207,10 @@
               "description": "Screen perpetual futures contracts",
               "options": {
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 },
                 "trader-type": {
                   "description": "Filter by trader type. One of: all, sm, whale, public_figure, high_winrate_hl_perps_trader. Defaults to all.",
@@ -586,7 +1238,10 @@
               "description": "Perpetual futures PnL leaderboard",
               "options": {
                 "days": {
-                  "default": 30
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 30,
+                  "description": "Lookback window in days"
                 },
                 "premium-labels": {
                   "description": "Include premium Nansen labels in the response (true=premium, false=free-tier). When omitted, uses API default.",
@@ -604,7 +1259,9 @@
               "description": "Get Prediction Market OHLCV Candles",
               "options": {
                 "market-id": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Polymarket market ID (numeric, from the screener)"
                 }
               }
             },
@@ -613,7 +1270,9 @@
               "description": "Get Prediction Market Orderbook",
               "options": {
                 "market-id": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Polymarket market ID (numeric, from the screener)"
                 }
               }
             },
@@ -622,7 +1281,9 @@
               "description": "Get Prediction Market Top Holders",
               "options": {
                 "market-id": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Polymarket market ID (numeric, from the screener)"
                 }
               }
             },
@@ -631,7 +1292,9 @@
               "description": "Get Prediction Market Trades by Market",
               "options": {
                 "market-id": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Polymarket market ID (numeric, from the screener)"
                 }
               }
             },
@@ -640,25 +1303,70 @@
               "description": "Get Prediction Market Screener",
               "options": {
                 "query": {
-                  "default": ""
+                  "type": "string",
+                  "default": "",
+                  "description": "Text filter on market titles"
                 },
                 "sort-by": {
                   "description": "Deprecated: use --sort field:dir instead"
                 },
-                "tags": {},
-                "min-liquidity": {},
-                "max-liquidity": {},
-                "min-unique-traders-24h": {},
-                "max-unique-traders-24h": {},
-                "min-volume-24hr": {},
-                "max-volume-24hr": {},
-                "neg-risk": {},
-                "min-open-interest": {},
-                "max-open-interest": {},
-                "end-date-before": {},
-                "end-date-after": {},
-                "min-price": {},
-                "max-price": {}
+                "tags": {
+                  "type": "string",
+                  "description": "Comma-separated Polymarket tags to filter by"
+                },
+                "min-liquidity": {
+                  "type": "number",
+                  "description": "Minimum liquidity in USD"
+                },
+                "max-liquidity": {
+                  "type": "number",
+                  "description": "Maximum liquidity in USD"
+                },
+                "min-unique-traders-24h": {
+                  "type": "number",
+                  "description": "Minimum unique traders in the last 24 hours"
+                },
+                "max-unique-traders-24h": {
+                  "type": "number",
+                  "description": "Maximum unique traders in the last 24 hours"
+                },
+                "min-volume-24hr": {
+                  "type": "number",
+                  "description": "Minimum 24-hour volume in USD"
+                },
+                "max-volume-24hr": {
+                  "type": "number",
+                  "description": "Maximum 24-hour volume in USD"
+                },
+                "neg-risk": {
+                  "type": "boolean",
+                  "enum": ["true", "false"],
+                  "description": "Only negative-risk markets (true, or the bare flag) or only standard markets (false)"
+                },
+                "min-open-interest": {
+                  "type": "number",
+                  "description": "Minimum open interest in USD"
+                },
+                "max-open-interest": {
+                  "type": "number",
+                  "description": "Maximum open interest in USD"
+                },
+                "end-date-before": {
+                  "type": "string",
+                  "description": "Only markets ending before this date (ISO 8601)"
+                },
+                "end-date-after": {
+                  "type": "string",
+                  "description": "Only markets ending after this date (ISO 8601)"
+                },
+                "min-price": {
+                  "type": "number",
+                  "description": "Minimum outcome price (0-1)"
+                },
+                "max-price": {
+                  "type": "number",
+                  "description": "Maximum outcome price (0-1)"
+                }
               }
             },
             "event-screener": {
@@ -666,23 +1374,62 @@
               "description": "Get Prediction Market Event Screener",
               "options": {
                 "query": {
-                  "default": ""
+                  "type": "string",
+                  "default": "",
+                  "description": "Text filter on event titles"
                 },
                 "sort-by": {
                   "description": "Deprecated: use --sort field:dir instead"
                 },
-                "tags": {},
-                "min-liquidity": {},
-                "max-liquidity": {},
-                "min-unique-traders-24h": {},
-                "max-unique-traders-24h": {},
-                "min-volume-24hr": {},
-                "max-volume-24hr": {},
-                "neg-risk": {},
-                "min-open-interest": {},
-                "max-open-interest": {},
-                "end-date-before": {},
-                "end-date-after": {}
+                "tags": {
+                  "type": "string",
+                  "description": "Comma-separated Polymarket tags to filter by"
+                },
+                "min-liquidity": {
+                  "type": "number",
+                  "description": "Minimum liquidity in USD"
+                },
+                "max-liquidity": {
+                  "type": "number",
+                  "description": "Maximum liquidity in USD"
+                },
+                "min-unique-traders-24h": {
+                  "type": "number",
+                  "description": "Minimum unique traders in the last 24 hours"
+                },
+                "max-unique-traders-24h": {
+                  "type": "number",
+                  "description": "Maximum unique traders in the last 24 hours"
+                },
+                "min-volume-24hr": {
+                  "type": "number",
+                  "description": "Minimum 24-hour volume in USD"
+                },
+                "max-volume-24hr": {
+                  "type": "number",
+                  "description": "Maximum 24-hour volume in USD"
+                },
+                "neg-risk": {
+                  "type": "boolean",
+                  "enum": ["true", "false"],
+                  "description": "Only negative-risk markets (true, or the bare flag) or only standard markets (false)"
+                },
+                "min-open-interest": {
+                  "type": "number",
+                  "description": "Minimum open interest in USD"
+                },
+                "max-open-interest": {
+                  "type": "number",
+                  "description": "Maximum open interest in USD"
+                },
+                "end-date-before": {
+                  "type": "string",
+                  "description": "Only events ending before this date (ISO 8601)"
+                },
+                "end-date-after": {
+                  "type": "string",
+                  "description": "Only events ending after this date (ISO 8601)"
+                }
               }
             },
             "pnl-by-market": {
@@ -690,7 +1437,9 @@
               "description": "Get Prediction Market PnL by Market",
               "options": {
                 "market-id": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Polymarket market ID (numeric, from the screener)"
                 }
               }
             },
@@ -699,7 +1448,9 @@
               "description": "Get Prediction Market PnL by Address",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Polymarket trader address"
                 }
               }
             },
@@ -708,7 +1459,9 @@
               "description": "Get Prediction Market Position Detail",
               "options": {
                 "market-id": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Polymarket market ID (numeric, from the screener)"
                 }
               }
             },
@@ -717,7 +1470,9 @@
               "description": "Get Prediction Market Trades by Address",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Polymarket trader address"
                 }
               }
             },
@@ -730,7 +1485,9 @@
               "description": "Get wallet-level PnL summary for a Polymarket address",
               "options": {
                 "address": {
-                  "required": true
+                  "type": "string",
+                  "required": true,
+                  "description": "Polymarket trader address"
                 }
               }
             }
@@ -738,9 +1495,176 @@
           "description": "Polymarket prediction market analytics"
         },
         "points": {
+          "description": "Nansen Points analytics",
           "subcommands": {
             "leaderboard": {
-              "description": "Points leaderboard"
+              "description": "Points leaderboard (unavailable)"
+            }
+          }
+        },
+        "chain-rank": {
+          "endpoint": "/api/v1/chains/chain-rank",
+          "description": "Rank chains by growth metrics",
+          "options": {
+            "timeframe-days": {
+              "type": "number",
+              "enum": [7, 30, 365],
+              "default": 7,
+              "description": "Growth window in days"
+            },
+            "chain-type": {
+              "type": "string",
+              "enum": ["all", "evm"],
+              "default": "all",
+              "description": "Include all chains or only EVM chains"
+            }
+          }
+        },
+        "token-sectors": {
+          "endpoint": "/api/v1/search/token-sectors",
+          "description": "List token sectors available for filtering"
+        },
+        "address-premium-labels": {
+          "endpoint": "/api/v1/profiler/address/premium-labels",
+          "description": "Get all labels for an address, including premium labels",
+          "options": {
+            "address": {
+              "type": "string",
+              "required": true,
+              "description": "Address to fetch labels for"
+            },
+            "chain": {
+              "type": "string",
+              "default": "all",
+              "description": "Chain to fetch labels for, or all"
+            },
+            "page": {
+              "type": "number",
+              "default": 1,
+              "description": "1-based page number"
+            },
+            "limit": {
+              "type": "number",
+              "default": 100,
+              "description": "Labels per page"
+            }
+          }
+        },
+        "smart-money-pnl-leaderboard": {
+          "endpoint": "/api/v1/smart-money/pnl-leaderboard",
+          "description": "Rank smart money wallets by PnL",
+          "options": {
+            "chains": {
+              "default": "solana",
+              "description": "Comma-separated chains"
+            },
+            "timeframe-days": {
+              "type": "number",
+              "enum": [1, 7, 30, 90, 180],
+              "default": 7,
+              "description": "Timeframe in days"
+            },
+            "filters": {
+              "type": "string",
+              "description": "Filters as JSON object"
+            },
+            "sort": {
+              "type": "string",
+              "description": "Sort order (field[:asc|desc])"
+            },
+            "page": {
+              "type": "number",
+              "default": 1,
+              "description": "1-based page number; maps to pagination.page"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max results per page; maps to pagination.per_page"
+            }
+          }
+        },
+        "position-intelligence": {
+          "endpoint": "/api/v1/tgm/position-intelligence",
+          "description": "Aggregate Hyperliquid positions by trader cohort",
+          "options": {
+            "symbol": {
+              "required": true,
+              "description": "Hyperliquid asset symbol (--token-address is accepted as an alias)"
+            }
+          }
+        },
+        "perp-pnl-summary": {
+          "endpoint": "/api/v1/profiler/perp-pnl-summary",
+          "description": "Summarize realized Hyperliquid PnL for an address",
+          "options": {
+            "address": {
+              "type": "string",
+              "required": true,
+              "description": "Hyperliquid trader address"
+            },
+            "from-date": {
+              "required": true,
+              "description": "Start of date range"
+            },
+            "to-date": {
+              "required": true,
+              "description": "End of date range"
+            }
+          }
+        },
+        "historical-token-ohlcv": {
+          "endpoint": "/api/v1beta1/tgm/historical-token-ohlcv",
+          "description": "Historical token OHLCV candles",
+          "options": {
+            "token-address": {
+              "required": true,
+              "description": "Token address or Hyperliquid asset symbol"
+            },
+            "chain": {
+              "type": "string",
+              "enum": ["base", "bnb", "ethereum", "hyperliquid", "solana"],
+              "default": "solana",
+              "description": "Chain the token lives on"
+            },
+            "from-date": {
+              "required": true,
+              "description": "Start of data window"
+            },
+            "as-of-date": {
+              "description": "End of data window; exactly one of --as-of-date or --as-of-ts is required"
+            },
+            "as-of-ts": {
+              "description": "Exact Hyperliquid cutoff timestamp; exactly one of --as-of-date or --as-of-ts is required"
+            },
+            "timeframe": {
+              "type": "string",
+              "required": true,
+              "enum": ["5m", "15m", "30m", "1h", "1d", "1w"],
+              "description": "Candle interval"
+            },
+            "apply-blacklist-filter": {
+              "type": "boolean",
+              "description": "Apply blacklist filtering for 1d/1w non-Hyperliquid requests"
+            }
+          }
+        },
+        "transaction-with-token-transfer-lookup": {
+          "endpoint": "/api/v1/transaction-with-token-transfer-lookup",
+          "description": "Look up a transaction and its token/NFT transfers",
+          "options": {
+            "transaction-hash": {
+              "type": "string",
+              "required": true,
+              "description": "Transaction hash to look up"
+            },
+            "chain": {
+              "type": "string",
+              "enum": ["all", "arbitrum", "avalanche", "base", "bitcoin", "bnb", "ethereum", "hyperevm", "injective", "iotaevm", "linea", "mantle", "mantra", "monad", "near", "optimism", "plasma", "robinhood", "sei", "sonic", "starknet", "sui", "ton", "tron"],
+              "default": "ethereum",
+              "description": "Chain the transaction was made on"
+            },
+            "block-timestamp": {
+              "description": "Block timestamp (required for bitcoin, tron, ton, starknet, and sui)"
             }
           }
         },
@@ -936,7 +1860,7 @@
               "description": "Reference date for label and pricing resolution (YYYY-MM-DD)"
             },
             "block-timestamp": {
-              "description": "Block timestamp (YYYY-MM-DD HH:MM:SS) \u2014 skips slow hash-resolution step if provided"
+              "description": "Block timestamp (YYYY-MM-DD HH:MM:SS) — skips slow hash-resolution step if provided"
             },
             "chain": {
               "default": "ethereum",
@@ -965,9 +1889,10 @@
       }
     },
     "alerts": {
-      "description": "Smart alert management \u2014 create, update, toggle, delete alerts",
+      "description": "Smart alert management — create, update, toggle, delete alerts",
       "subcommands": {
         "list": {
+          "endpoint": "/api/v1/smart-alert/list",
           "description": "List all alerts",
           "returns": [
             "id",
@@ -981,7 +1906,9 @@
           ]
         },
         "create": {
+          "endpoint": "/api/v1/smart-alert",
           "description": "Create a new alert",
+          "notes": "Sent as POST /api/v1/smart-alert. alerts update PATCHes the same path; the schema declares routes by path only, so the two subcommands intentionally share one endpoint entry and one credit cost.",
           "options": {
             "name": {
               "type": "string",
@@ -1032,7 +1959,9 @@
           }
         },
         "update": {
+          "endpoint": "/api/v1/smart-alert",
           "description": "Update an existing alert. Usage: nansen alerts update <id> [options]",
+          "notes": "Sent as PATCH /api/v1/smart-alert. alerts create POSTs the same path; the schema declares routes by path only, so the two subcommands intentionally share one endpoint entry and one credit cost.",
           "options": {
             "name": {
               "type": "string",
@@ -1085,6 +2014,7 @@
           }
         },
         "toggle": {
+          "endpoint": "/api/v1/smart-alert/toggle",
           "description": "Enable or disable an alert. Usage: nansen alerts toggle <id> --enabled|--disabled",
           "options": {
             "enabled": {
@@ -1098,6 +2028,7 @@
           }
         },
         "delete": {
+          "endpoint": "/api/v1/smart-alert/{alertId}",
           "description": "Delete an alert. Usage: nansen alerts delete <id>",
           "options": {}
         },
@@ -1217,7 +2148,10 @@
       "description": "DEX trading commands",
       "subcommands": {
         "quote": {
-          "description": "Get a DEX swap quote (same-chain or cross-chain)",
+          "description": "Get a DEX swap quote (same-chain or cross-chain). Explicitly blank --swap-mode, --wallet, --to-chain, --aggregator, and --amount-unit values are rejected.",
+          "apiEndpoints": [
+            "/api/v1/sanctions/screen"
+          ],
           "options": {
             "chain": {
               "type": "string",
@@ -1226,7 +2160,7 @@
             },
             "to-chain": {
               "type": "string",
-              "description": "Destination blockchain for cross-chain swap (solana or base). Omit for same-chain. At least one side must be USDC or a native token (ETH, SOL). Non-native to non-native is not supported \u2014 swap to USDC first, then bridge. Bridge providers (Li.Fi or Relay) are selected automatically based on best price. Sub-dollar swaps are supported via Relay."
+              "description": "Destination blockchain for cross-chain swap (solana or base). Omit for same-chain. At least one side must be USDC or a native token (ETH, SOL). Non-native to non-native is not supported — swap to USDC first, then bridge. Bridge providers (Li.Fi or Relay) are selected automatically based on best price. Sub-dollar swaps are supported via Relay."
             },
             "from": {
               "type": "string",
@@ -1249,7 +2183,7 @@
             },
             "wallet": {
               "type": "string",
-              "description": "Wallet name (or \"walletconnect\"/\"wc\" for WalletConnect, EVM only). A configured wallet is required \u2014 run `nansen wallet create` if you haven't set one up yet."
+              "description": "Wallet name (or \"walletconnect\"/\"wc\" for WalletConnect, EVM only). A configured wallet is required — run `nansen wallet create` if you haven't set one up yet."
             },
             "to-wallet": {
               "type": "string",
@@ -1258,15 +2192,46 @@
             "aggregator": {
               "type": "string",
               "description": "Force a specific aggregator: lifi, relay, jupiter, or okx. Filters the returned quote list client-side; errors if no quote from that aggregator was returned."
+            },
+            "swap-mode": {
+              "type": "string",
+              "default": "exactIn",
+              "enum": ["exactIn", "exactOut"],
+              "description": "\"exactIn\" (default) to spend exactly --amount of the sell token, or \"exactOut\" to receive exactly --amount of the buy token. Not supported together with --amount-unit percent."
+            },
+            "slippage": {
+              "type": "string",
+              "description": "Slippage tolerance as a decimal between 0 and 1 (e.g. 0.03 for 3%). Values outside that range are rejected."
+            },
+            "auto-slippage": {
+              "type": "boolean",
+              "description": "Let slippage be calculated automatically instead of using a fixed --slippage."
+            },
+            "max-auto-slippage": {
+              "type": "string",
+              "description": "Upper bound applied when --auto-slippage is enabled, as a decimal between 0 and 1 (e.g. 0.03 for 3%)."
+            },
+            "max-input": {
+              "type": "string",
+              "description": "exactOut only: hard ceiling on the sell-token spend, in base units. Required on every chain for --swap-mode exactOut. Measured against the slippage-buffered spend (input + slippage), not the bare quote input, so it matches the amount that can actually leave the wallet. Persisted with the quote and enforced before signing — a quote whose buffered spend exceeds it is refused."
             }
           },
           "prerequisites": [
-            "A local wallet must be configured. Run: nansen wallet create"
+            "A local wallet must be configured. Run: nansen wallet create",
+            "API access is required for pre-trade compliance screening. Run: nansen login (or set NANSEN_API_KEY)"
           ]
         },
         "execute": {
-          "description": "Sign and broadcast a quoted trade",
+          "description": "Sign and broadcast a quoted trade. Explicitly blank --wallet values are rejected.",
+          "apiEndpoints": [
+            "/api/v1/sanctions/screen"
+          ],
           "options": {
+            "quote": {
+              "type": "string",
+              "required": true,
+              "description": "Quote ID returned by `nansen trade quote` (alias: --quote-id)."
+            },
             "chain": {
               "type": "string",
               "default": "base",
@@ -1279,8 +2244,40 @@
             "gasless": {
               "type": "boolean",
               "description": "Relay-only: have Relay's solver pay gas + broadcast (user signs only). Requires the selected quote's aggregator to be \"relay\". Not supported via WalletConnect."
+            },
+            "quote-index": {
+              "type": "string",
+              "description": "Pin a specific quote by 0-based index when the cached quote returned several. Must be within range; there is no fallback to the other quotes."
+            },
+            "no-simulate": {
+              "type": "boolean",
+              "description": "Skip the pre-broadcast simulation (the eth_call revert check)."
+            },
+            "no-verify-outcome": {
+              "type": "boolean",
+              "description": "Skip swap-outcome verification. That check simulates the swap and confirms the wallet's balance changes match the quote (input spent within your max, expected output received, no other asset moved) before broadcasting; it needs a simulation-capable endpoint (NANSEN_BASE_SIM_RPC on EVM, NANSEN_SOLANA_SIM_RPC on Solana) and degrades with a warning when none is available."
+            },
+            "no-revoke-excessive-allowance": {
+              "type": "boolean",
+              "description": "Skip revoking an existing on-chain ERC-20 allowance before re-approving when it exceeds 10x this trade's scoped amount. By default, an oversized or legacy allowance is revoked to zero and a fresh trade-scoped allowance is granted. WalletConnect users will see separate wallet prompts for the revoke and re-approval."
+            },
+            "dry-run": {
+              "type": "boolean",
+              "description": "Run every sign-free preflight available from the cached quote, its public signer address and read-only RPC calls; plan the approval and print what would be sent; then stop before wallet credentials or signing. Nothing is signed or broadcast, no wallet password is needed, and the quote stays usable. Real execution still resolves and revalidates the live signer. On EVM preview also reads the current allowance and runs the pre-broadcast revert simulation when no approval is outstanding. Exits 0."
+            },
+            "yes": {
+              "type": "boolean",
+              "description": "Skip the confirmation prompt (alias: -y, or set NANSEN_YES=1). The prompt is only shown when stdin is an interactive terminal; when stdin is not a terminal (agents, CI, pipes) the command proceeds unprompted whether or not this is passed. Declining the prompt exits 1 with nothing signed."
             }
-          }
+          },
+          "examples": [
+            "nansen trade execute --quote 1708900000000-abc123",
+            "nansen trade execute --quote 1708900000000-abc123 --dry-run",
+            "nansen trade execute --quote 1708900000000-abc123 --yes"
+          ],
+          "prerequisites": [
+            "API access is required for pre-trade compliance screening. Run: nansen login (or set NANSEN_API_KEY)"
+          ]
         },
         "bridge-status": {
           "description": "Check cross-chain bridge transaction status. Aggregator (Li.Fi or Relay) is auto-detected from a local tx record saved at execute time (kept 30 days); pass --aggregator to override when polling from a different machine.",
@@ -1302,7 +2299,7 @@
             },
             "aggregator": {
               "type": "string",
-              "description": "lifi or relay. Overrides auto-detection \u2014 use when polling from a different machine or after the 30-day local record TTL has expired."
+              "description": "lifi or relay. Overrides auto-detection — use when polling from a different machine or after the 30-day local record TTL has expired."
             }
           }
         },
@@ -1310,7 +2307,7 @@
           "description": "Limit order management (Solana only)",
           "subcommands": {
             "create": {
-              "description": "Place a new limit order",
+              "description": "Place a new limit order. Explicitly blank --expires values are rejected; omission keeps the 30d default. Explicitly blank --wallet values are rejected.",
               "options": {
                 "from": {
                   "type": "string",
@@ -1344,7 +2341,7 @@
                 },
                 "slippage-bps": {
                   "type": "number",
-                  "description": "Slippage tolerance in basis points (e.g. 50 = 0.5%)"
+                  "description": "Slippage as a whole integer in basis points, 0-10000 (50 = 0.5%), omit for auto"
                 },
                 "expires": {
                   "type": "string",
@@ -1364,7 +2361,7 @@
               ]
             },
             "list": {
-              "description": "List your limit orders",
+              "description": "List your limit orders. Explicitly blank --wallet, --limit, --offset, --dir, and --mint values are rejected.",
               "options": {
                 "state": {
                   "type": "string",
@@ -1403,7 +2400,7 @@
               ]
             },
             "cancel": {
-              "description": "Cancel an open limit order",
+              "description": "Cancel an open limit order. Explicitly blank --wallet values are rejected.",
               "options": {
                 "order": {
                   "type": "string",
@@ -1420,7 +2417,7 @@
               ]
             },
             "update": {
-              "description": "Update trigger price or slippage on an existing order",
+              "description": "Update trigger price or slippage on an existing order. Explicitly blank --wallet values are rejected.",
               "options": {
                 "order": {
                   "type": "string",
@@ -1433,7 +2430,7 @@
                 },
                 "slippage-bps": {
                   "type": "number",
-                  "description": "New slippage in basis points (0-10000)"
+                  "description": "New slippage as a whole integer in basis points (0-10000)"
                 },
                 "wallet": {
                   "type": "string",
@@ -1449,13 +2446,27 @@
       }
     },
     "wallet": {
-      "description": "Wallet management",
+      "description": "Wallet management. x402 auto-payments are guarded by a client-side policy: per-payment USD cap via NANSEN_X402_MAX_AMOUNT (default 1.00; 'unlimited' to disable) and an optional recipient allowlist via NANSEN_X402_ALLOWED_PAYTO (comma-separated addresses).",
       "subcommands": {
         "create": {
-          "description": "Create a new wallet"
+          "description": "Create a new wallet. Explicitly blank --name values are rejected for local and Privy wallets.",
+          "options": {
+            "unsafe-no-password": {
+              "type": "boolean",
+              "description": "Skip encryption; private keys are stored unencrypted on disk (local only)"
+            }
+          },
+          "examples": [
+            "nansen wallet create --name trading",
+            "nansen wallet create --name agent-wallet --provider privy"
+          ]
         },
         "list": {
-          "description": "List all wallets"
+          "description": "List all wallets",
+          "examples": [
+            "nansen wallet list",
+            "nansen wallet list --pretty"
+          ]
         },
         "show": {
           "description": "Show wallet details",
@@ -1463,40 +2474,142 @@
             "name": {
               "description": "Wallet name"
             }
-          }
+          },
+          "examples": [
+            "nansen wallet show <name>"
+          ]
         },
         "send": {
-          "description": "Send tokens or native currency",
+          "description": "Send tokens or native currency. Explicitly blank --token and --wallet values are rejected; omit them for native currency and the default wallet.",
           "options": {
             "to": {
-              "required": true
+              "type": "string",
+              "required": true,
+              "description": "Recipient address"
             },
             "chain": {
-              "required": true
+              "type": "string",
+              "required": true,
+              "enum": ["evm", "solana", "ethereum", "base"],
+              "description": "Chain to send on (evm is an alias for ethereum)"
             },
             "amount": {
-              "required": true
+              "type": "string",
+              "description": "Amount to send in human-readable units, e.g. 1.5. Required unless --max is set"
+            },
+            "max": {
+              "type": "boolean",
+              "description": "Send the entire spendable balance instead of --amount"
             }
-          }
+          },
+          "examples": [
+            "nansen wallet send --to <address> --amount 1.5 --chain evm",
+            "nansen wallet send --to <address> --max --chain solana"
+          ]
         },
         "export": {
-          "description": "Export private keys"
+          "description": "Export private keys (redacted by default; pass --reveal or --file <path> for the actual keys)",
+          "options": {
+            "reveal": {
+              "type": "boolean",
+              "description": "Print private keys in plaintext to stdout (explicit acknowledgement; warns on interactive terminals)"
+            },
+            "file": {
+              "type": "string",
+              "description": "Write private keys to this path instead of stdout (created with 0600 permissions, refuses to overwrite)"
+            }
+          },
+          "examples": [
+            "nansen wallet export <name>",
+            "nansen wallet export <name> --file backup.json"
+          ]
         },
         "delete": {
-          "description": "Delete a wallet"
+          "description": "Delete a wallet",
+          "examples": [
+            "nansen wallet delete <name>"
+          ]
         },
         "default": {
-          "description": "Set default wallet"
+          "description": "Set default wallet",
+          "examples": [
+            "nansen wallet default <name>"
+          ]
+        },
+        "forget-password": {
+          "description": "Forget the saved wallet password, removing it from the OS keychain and from the local credentials file. Later commands fall back to NANSEN_WALLET_PASSWORD or an interactive prompt (--human).",
+          "examples": [
+            "nansen wallet forget-password"
+          ]
+        },
+        "secure": {
+          "description": "Move a wallet password that is held in the local credentials file or in NANSEN_WALLET_PASSWORD into the OS keychain, then delete the plaintext copy. Verifies the password against the stored hash first, reports success when it is already in the keychain, and fails with KEYCHAIN_UNAVAILABLE when no OS keychain is reachable.",
+          "examples": [
+            "nansen wallet secure",
+            "NANSEN_WALLET_PASSWORD=<password> nansen wallet secure"
+          ]
         }
       }
     },
     "account": {
+      "endpoint": "/api/v1/account",
       "description": "Show API key status, plan, and remaining credits. Does not consume credits."
+    },
+    "auth": {
+      "description": "Offline authentication status. Reports API key presence and source (env var vs config file), base URL, and x402 wallet readiness without any network call. Consumes no credits.",
+      "subcommands": {
+        "status": {
+          "description": "Show where credentials come from, entirely offline",
+          "returns": [
+            "logged_in",
+            "api_key.present",
+            "api_key.source",
+            "api_key.masked",
+            "config_file.path",
+            "config_file.exists",
+            "config_file.error",
+            "base_url.value",
+            "base_url.source",
+            "x402.configured",
+            "x402.wallets_dir",
+            "x402.wallets_dir_error",
+            "x402.wallet_count",
+            "x402.default_wallet",
+            "x402.default_wallet_provider",
+            "x402.password.available",
+            "x402.password.source",
+            "x402.password.keychain_available",
+            "offline"
+          ],
+          "examples": [
+            "nansen auth status --pretty"
+          ]
+        }
+      }
+    },
+    "doctor": {
+      "description": "Diagnostics for the CLI setup: Node version, auth config, wallet storage and password hygiene, keychain availability, caches, telemetry, plus a safe API connectivity probe (unauthenticated, consumes no credits). Local checks work with the API unavailable; --offline skips network entirely.",
+      "options": {
+        "json": {
+          "type": "boolean",
+          "description": "Return machine-readable checks ({id, status, message, fix?}) instead of formatted text"
+        },
+        "offline": {
+          "type": "boolean",
+          "description": "Skip the connectivity probe — no network access at all"
+        }
+      },
+      "examples": [
+        "nansen doctor",
+        "nansen doctor --offline",
+        "nansen doctor --json --pretty"
+      ]
     },
     "web": {
       "description": "Web search and fetch commands",
       "subcommands": {
         "search": {
+          "endpoint": "/api/v1/search/web-search",
           "description": "Search the web for one or more queries in parallel",
           "options": {
             "query": {
@@ -1515,6 +2628,7 @@
           ]
         },
         "fetch": {
+          "endpoint": "/api/v1/search/web-fetch",
           "description": "Fetch and analyze content from one or more URLs using AI",
           "options": {
             "url": {
@@ -1534,7 +2648,11 @@
       }
     },
     "agent": {
-      "description": "Nansen AI research agent \u2014 ask questions about wallets, tokens, and on-chain activity",
+      "apiEndpoints": [
+        "/api/v1/agent/fast",
+        "/api/v1/agent/expert"
+      ],
+      "description": "Nansen AI research agent — ask questions about wallets, tokens, and on-chain activity",
       "options": {
         "expert": {
           "type": "boolean",
@@ -1561,6 +2679,105 @@
         "text",
         "tool_calls"
       ]
+    },
+    "mcp": {
+      "description": "Install, uninstall, or verify the hosted Nansen MCP server (https://mcp.nansen.ai/ra/mcp)",
+      "subcommands": {
+        "verify": {
+          "description": "Check MCP server reachability and verify an API key on the paid data path (~1 credit)",
+          "options": {
+            "api-key": {
+              "type": "string",
+              "description": "API key to test; overrides NANSEN_API_KEY and ~/.nansen/config.json"
+            },
+            "url": {
+              "type": "string",
+              "default": "https://mcp.nansen.ai/ra/mcp",
+              "description": "Hosted MCP server URL. A saved API key is not sent to a non-default URL unless you pass --send-api-key, and never over plain HTTP to a non-loopback host."
+            },
+            "send-api-key": {
+              "type": "boolean",
+              "description": "Presence-only flag — pass it bare, never with a value (`--send-api-key false` is rejected). Authorizes sending your saved API key to a custom --url (must be https:// or a loopback host). Not needed when you pass --api-key explicitly."
+            },
+            "json": {
+              "type": "boolean",
+              "description": "Return machine-readable verification checks and exit non-zero on failure"
+            }
+          },
+          "examples": [
+            "npx -y nansen-cli mcp verify",
+            "nansen mcp verify --json",
+            "nansen mcp verify --url https://mcp.example.dev/ra/mcp --api-key <key>",
+            "nansen mcp verify --url https://mcp.example.dev/ra/mcp --send-api-key"
+          ]
+        },
+        "install": {
+          "description": "Add the Nansen MCP server to a client's config. Client (positional): claude-code, claude-desktop, or cursor. Uses the API key from `nansen login` / NANSEN_API_KEY; re-run after key rotation to update the entry.",
+          "args": [
+            {
+              "name": "client",
+              "required": true,
+              "enum": ["claude-code", "claude-desktop", "cursor"],
+              "description": "MCP client to configure"
+            }
+          ],
+          "options": {
+            "dry-run": {
+              "type": "boolean",
+              "description": "Print the target config path and entry (API key redacted) without writing"
+            }
+          },
+          "examples": [
+            "nansen mcp install claude-code",
+            "nansen mcp install cursor --dry-run"
+          ]
+        },
+        "uninstall": {
+          "description": "Remove the Nansen MCP server entry from a client's config. Client (positional): claude-code, claude-desktop, or cursor.",
+          "args": [
+            {
+              "name": "client",
+              "required": true,
+              "enum": ["claude-code", "claude-desktop", "cursor"],
+              "description": "MCP client to remove the entry from"
+            }
+          ],
+          "options": {
+            "dry-run": {
+              "type": "boolean",
+              "description": "Report whether the Nansen entry would be removed without writing"
+            }
+          },
+          "examples": [
+            "nansen mcp uninstall claude-code",
+            "nansen mcp uninstall cursor --dry-run"
+          ]
+        }
+      }
+    },
+    "completion": {
+      "description": "Generate a shell completion script from this schema (prints to stdout; nothing is written or fetched)",
+      "subcommands": {
+        "bash": {
+          "description": "Print the bash completion script",
+          "examples": [
+            "nansen completion bash > /etc/bash_completion.d/nansen",
+            "eval \"$(nansen completion bash)\""
+          ]
+        },
+        "zsh": {
+          "description": "Print the zsh completion script",
+          "examples": [
+            "nansen completion zsh > \"${fpath[1]}/_nansen\""
+          ]
+        },
+        "fish": {
+          "description": "Print the fish completion script",
+          "examples": [
+            "nansen completion fish > ~/.config/fish/completions/nansen.fish"
+          ]
+        }
+      }
     }
   },
   "globalOptions": {
@@ -1576,14 +2793,32 @@
       "type": "string",
       "description": "Comma-separated list of fields to include in output"
     },
+    "limit": {
+      "type": "number",
+      "description": "Maximum results per page for list-returning research commands; maps to pagination.per_page. General endpoints default to 10 (max 1000), while profiler address endpoints default to 20 (max 100). Supported by smart-money, profiler, token, perp, points, prediction-market, and supported research historical-* commands. Commands that declare their own limit option (search, token top-tokens, trade limit-order list) use those command-specific semantics instead; token ohlcv, profiler perp-positions, and historical-token-flow-summary do not support pagination. profiler labels defaults to 100 when omitted."
+    },
+    "page": {
+      "type": "number",
+      "default": 1,
+      "description": "1-based page number for list-returning research commands; maps to pagination.page. Supported by smart-money, profiler, token, perp, points, prediction-market, and supported research historical-* commands. Trade, wallet, and operational commands ignore it; token ohlcv, profiler perp-positions, and historical-token-flow-summary do not support pagination. profiler labels defaults to page 1 when omitted."
+    },
     "no-retry": {
       "type": "boolean",
       "description": "Disable automatic retry on rate limits/errors"
     },
     "retries": {
-      "type": "number",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
       "default": 3,
-      "description": "Max retry attempts"
+      "description": "Max retry attempts (non-negative safe integer)"
+    },
+    "cache-ttl": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "default": 300,
+      "description": "Cache TTL in seconds (non-negative safe integer; 0 disables cache reads)"
     },
     "format": {
       "type": "string",
@@ -1599,24 +2834,42 @@
     }
   },
   "chains": [
-    "ethereum",
-    "solana",
-    "base",
-    "bnb",
+    "algorand",
+    "aptos",
     "arbitrum",
-    "polygon",
-    "optimism",
+    "arc",
     "avalanche",
-    "linea",
-    "scroll",
-    "mantle",
-    "ronin",
-    "sei",
-    "plasma",
-    "sonic",
-    "monad",
+    "base",
+    "bitcoin",
+    "bitlayer",
+    "bnb",
+    "chiliz",
+    "citrea",
+    "ethereum",
+    "gravity",
     "hyperevm",
-    "iotaevm"
+    "hyperliquid",
+    "injective",
+    "iotaevm",
+    "linea",
+    "mantle",
+    "mantra",
+    "monad",
+    "near",
+    "optimism",
+    "plasma",
+    "polygon",
+    "robinhood",
+    "sei",
+    "solana",
+    "sonic",
+    "stacks",
+    "starknet",
+    "stellar",
+    "sui",
+    "ton",
+    "tron",
+    "viction"
   ],
   "smartMoneyLabels": [
     "Fund",

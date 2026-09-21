@@ -21,10 +21,10 @@ allowed-tools: Bash(nansen:*)
 ## Auth Setup
 
 ```bash
-# Save API key (non-interactive)
-nansen login --api-key <key>
-# Or via env var:
-NANSEN_API_KEY=<key> nansen login
+# Save API key interactively
+nansen login --human
+# Or use NANSEN_API_KEY after provisioning it through your environment/secret manager
+nansen login
 
 # Verify
 nansen research profiler labels --address 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045 --chain ethereum
@@ -152,10 +152,22 @@ nansen wallet send --to <addr> --amount 1.0 --chain evm --dry-run
 ## Export & Delete
 
 ```bash
-# Password auto-resolved from keychain
+# Default is REDACTED — shows addresses only, never private keys
 nansen wallet export <name>
+
+# Write private keys to a file only the owner can read (0600, refuses to overwrite)
+nansen wallet export <name> --file <path>
+
+# Print private keys in plaintext to stdout (explicit acknowledgement required;
+# warns on stderr when stdout is an interactive terminal)
+nansen wallet export <name> --reveal
+
+# Password auto-resolved from keychain (needed for --reveal / --file)
 nansen wallet delete <name>
 ```
+
+Prefer `--file` over `--reveal`: plaintext on stdout ends up in terminal
+scrollback, shell logs, and agent transcripts.
 
 ## Forget Password
 
@@ -182,6 +194,8 @@ For detailed migration steps (from `~/.nansen/.env`, `.credentials`, or env-var-
 | `--max` | Send entire balance |
 | `--dry-run` | Preview without broadcasting |
 | `--provider` | Wallet provider: `local` (default, encrypted on disk) or `privy` (server-side via Privy API) |
+| `--reveal` | Export only: print private keys in plaintext to stdout (required acknowledgement) |
+| `--file` | Export only: write private keys to this path (created 0600, refuses to overwrite) |
 | `--human` | Enable interactive prompts (human terminal use only — agents must NOT use this) |
 | `--unsafe-no-password` | Skip encryption (keys stored in plaintext — NOT recommended) |
 
@@ -190,7 +204,7 @@ For detailed migration steps (from `~/.nansen/.env`, `.credentials`, or env-var-
 | Var | Purpose |
 |-----|---------|
 | `NANSEN_WALLET_PASSWORD` | Wallet encryption password — only needed for initial `wallet create`. After that, the OS keychain handles it. |
-| `NANSEN_API_KEY` | API key (also set via `nansen login --api-key <key>`) |
+| `NANSEN_API_KEY` | API key (can also be saved via `nansen login --human`) |
 | `PRIVY_APP_ID` | Privy application ID (required for `--provider privy`) |
 | `PRIVY_APP_SECRET` | Privy application secret (required for `--provider privy`) |
 | `NANSEN_WALLET_PROVIDER` | Default provider for wallet create — `local` or `privy` |

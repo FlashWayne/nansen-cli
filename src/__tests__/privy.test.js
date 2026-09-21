@@ -8,6 +8,15 @@ import os from "os";
 import path from "path";
 import { PrivyClient, createPrivyPaymentSignatures } from "../privy.js";
 
+// Prevent evaluatePaymentRequirement → resolveMaxAmountUsd → getWalletConfig
+// from reading the real ~/.nansen/wallets/config.json. Without this mock the
+// cap check is coincidentally safe in CI (no config file exists), but would
+// break on a dev machine that has x402MaxAmount set below the test amounts.
+vi.mock("../wallet.js", async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, getWalletConfig: () => ({}) };
+});
+
 // ============= PrivyClient =============
 
 describe("PrivyClient", () => {
@@ -39,6 +48,9 @@ describe("PrivyClient", () => {
       `Basic ${Buffer.from("app-id:app-secret").toString("base64")}`
     );
     expect(opts.headers["privy-app-id"]).toBe("app-id");
+    // Credentialed request must refuse redirects rather than relay Basic auth /
+    // privy-app-id to a redirect target.
+    expect(opts.redirect).toBe("error");
 
     vi.unstubAllGlobals();
   });
@@ -52,6 +64,19 @@ describe("PrivyClient", () => {
     }));
 
     await expect(client.createWallet("invalid")).rejects.toThrow("Invalid chain_type");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("converts a redirect rejection (redirect: 'error') into an actionable message", async () => {
+    const client = new PrivyClient("app-id", "app-secret");
+    // undici throws a bare TypeError('fetch failed') when redirect:'error' hits a 3xx.
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fetch failed")));
+
+    const err = await client.listWallets().catch((e) => e);
+    expect(err.message).toMatch(/Privy API request failed/);
+    expect(err.message).toContain("GET /wallets");
+    expect(err.message).not.toBe("fetch failed"); // not the undecorated TypeError
 
     vi.unstubAllGlobals();
   });
@@ -308,6 +333,41 @@ describe("createPrivyPaymentSignatures", () => {
     expect(decoded.payload.signature).toBe("0xfakesignature");
   });
 
+  it("falls back to pay_to for the authorization recipient when payTo is absent", async () => {
+    // Legacy server sends only snake_case `pay_to`. The signed typed data uses
+    // the fallback, so the header's echoed `authorization.to` must match it too
+    // (otherwise the header recipient diverges from the signed authorization).
+    const { payTo: _drop, ...noCamel } = evmRequirement;
+    const legacyRequirement = { ...noCamel, pay_to: "0xlegacyrecipient" };
+
+    let callCount = 0;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            data: [{ id: "w-1", address: "0x1234567890abcdef1234567890abcdef12345678", chain_type: "ethereum" }],
+          }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ data: { signature: "0xfakesignature" } }),
+      });
+    }));
+
+    const response = make402Response([legacyRequirement]);
+    const results = [];
+    for await (const r of createPrivyPaymentSignatures(response, "https://api.nansen.ai/test")) {
+      results.push(r);
+    }
+
+    expect(results).toHaveLength(1);
+    const decoded = JSON.parse(atob(results[0].signature));
+    expect(decoded.payload.authorization.to).toBe("0xlegacyrecipient");
+  });
+
   it("uses PRIVY_WALLET_ID when set", async () => {
     process.env.PRIVY_WALLET_ID = "w-specific";
 
@@ -366,7 +426,14 @@ describe("createPrivyPaymentSignatures", () => {
       });
     }));
 
-    const req2 = { ...evmRequirement, network: "eip155:1" };
+    // Use X Layer USDT0 as the second requirement (also in the known-asset allowlist).
+    // extra.chainId must match the network's chain id (196 for X Layer, not 8453 for Base).
+    const req2 = {
+      ...evmRequirement,
+      network: "eip155:196",
+      asset: "0x779Ded0c9e1022225f8E0630b35a9b54bE713736",
+      extra: { ...evmRequirement.extra, chainId: 196 },
+    };
     const response = make402Response([evmRequirement, req2]);
     const results = [];
     for await (const r of createPrivyPaymentSignatures(response, "https://api.nansen.ai/test")) {
@@ -375,7 +442,7 @@ describe("createPrivyPaymentSignatures", () => {
 
     // First failed, second succeeded
     expect(results).toHaveLength(1);
-    expect(results[0].network).toBe("eip155:1");
+    expect(results[0].network).toBe("eip155:196");
   });
 });
 

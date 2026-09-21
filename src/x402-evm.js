@@ -6,6 +6,7 @@
 
 import crypto from 'crypto';
 import { keccak256, signSecp256k1 } from './crypto.js';
+import { resolvePaymentAmount, resolvePayTo } from './x402-policy.js';
 
 // ============= EIP-712 Type Hashing =============
 
@@ -214,12 +215,16 @@ export function createEvmPaymentPayload(requirements, privateKeyHex, walletAddre
     throw new Error(`Unsupported assetTransferMethod: ${method}`);
   }
 
-  // Token name and version from requirements.extra (set by server/facilitator)
+  // Token name and version from requirements.extra (set by server/facilitator).
+  // Both are required: the EIP-712 domain version varies by token (USDC on Base
+  // is "2", USDT0/BSC tokens are "1"), so guessing a default would silently
+  // produce an invalid signature. Refuse instead — matches the walletconnect/Privy
+  // path in buildEIP712TypedData.
   const tokenName = extra.name;
-  const tokenVersion = extra.version || '1';
+  const tokenVersion = extra.version;
 
-  if (!tokenName) {
-    throw new Error('EIP-712 domain name missing from requirements.extra');
+  if (!tokenName || !tokenVersion) {
+    throw new Error('EIP-712 domain name/version missing from requirements.extra');
   }
 
   // Generate random nonce (32 bytes)
@@ -229,6 +234,7 @@ export function createEvmPaymentPayload(requirements, privateKeyHex, walletAddre
   const now = Math.floor(Date.now() / 1000);
   const validAfter = '0';
   const validBefore = String(now + 3600);
+  const amount = resolvePaymentAmount(requirements);
 
   // EIP-712 domain
   const domain = {
@@ -241,8 +247,8 @@ export function createEvmPaymentPayload(requirements, privateKeyHex, walletAddre
   // EIP-3009 message
   const message = {
     from: walletAddress,
-    to: requirements.pay_to || requirements.payTo,
-    value: BigInt(requirements.amount),
+    to: resolvePayTo(requirements),
+    value: BigInt(amount),
     validAfter: BigInt(validAfter),
     validBefore: BigInt(validBefore),
     nonce: nonce,
@@ -260,7 +266,7 @@ export function createEvmPaymentPayload(requirements, privateKeyHex, walletAddre
       authorization: {
         from: walletAddress,
         to: message.to,
-        value: String(requirements.amount),
+        value: String(amount),
         validAfter: validAfter,
         validBefore: validBefore,
         nonce: nonce,
@@ -301,15 +307,16 @@ export function createPermit2ExactPayload(requirements, privateKeyHex, walletAdd
     throw new Error('spenderAddress missing from requirements.extra (required for permit2-exact)');
   }
 
-  const payTo = requirements.pay_to || requirements.payTo;
+  const payTo = resolvePayTo(requirements);
   const now = Math.floor(Date.now() / 1000);
   // 256-bit random nonce — Permit2 uses an unordered nonce bitmap.
   const nonce = BigInt('0x' + crypto.randomBytes(32).toString('hex')).toString();
   const deadline = String(now + 3600);
   const validAfter = String(now - 60); // allow clock skew
+  const amount = resolvePaymentAmount(requirements);
 
   const message = {
-    permitted: { token: requirements.asset, amount: BigInt(requirements.amount) },
+    permitted: { token: requirements.asset, amount: BigInt(amount) },
     spender,
     nonce: BigInt(nonce),
     deadline: BigInt(deadline),
@@ -324,7 +331,7 @@ export function createPermit2ExactPayload(requirements, privateKeyHex, walletAdd
     x402Version: 2,
     payload: {
       permit2Authorization: {
-        permitted: { token: requirements.asset, amount: String(requirements.amount) },
+        permitted: { token: requirements.asset, amount: String(amount) },
         from: walletAddress,
         spender,
         nonce,

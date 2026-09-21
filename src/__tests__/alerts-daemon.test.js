@@ -532,6 +532,31 @@ describe('daemon command', () => {
     }
   });
 
+  it('removes the PID file when the child exits during startup', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-start-'));
+    const pidFile = path.join(dir, 'daemon.pid');
+    const child = { pid: 4242, once: vi.fn(), unref: vi.fn() };
+    const command = buildDaemonCommand({
+      log: vi.fn(),
+      getApiKey: () => 'test-key',
+      spawnFn: vi.fn(() => child),
+      killFn: vi.fn(() => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); }),
+      waitFn: vi.fn(async () => {}),
+    });
+
+    try {
+      await expect(command(['start'], null, {}, {
+        'pid-file': pidFile,
+        'log-file': path.join(dir, 'daemon.log'),
+      })).rejects.toThrow('Daemon exited during startup');
+      expect(child.unref).toHaveBeenCalledOnce();
+      expect(fs.existsSync(pidFile)).toBe(false);
+      expect(fs.existsSync(`${pidFile}.lock`)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps the PID file until the daemon has exited', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-stop-'));
     const pidFile = path.join(dir, 'daemon.pid');

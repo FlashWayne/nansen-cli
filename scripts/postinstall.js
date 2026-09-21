@@ -41,9 +41,19 @@ function hasTTY() {
   return process.stdin.isTTY && process.stderr.isTTY;
 }
 
+// npx is a .cmd shim on Windows, and Node refuses to spawn .cmd/.bat without a
+// shell (CVE-2024-27980). Go through cmd.exe explicitly rather than enabling
+// `shell: true`, which would hand the whole command line to the shell parser.
+const IS_WIN = process.platform === "win32";
+
+function npxInvocation(args) {
+  return IS_WIN ? ["cmd.exe", ["/c", "npx", ...args]] : ["npx", args];
+}
+
 function hasNpx() {
   try {
-    execFileSync("npx", ["--version"], { stdio: "ignore", shell: process.platform === "win32" });
+    const [cmd, cmdArgs] = npxInvocation(["--version"]);
+    execFileSync(cmd, cmdArgs, { stdio: "ignore", shell: false });
     return true;
   } catch {
     return false;
@@ -86,7 +96,7 @@ function prompt(question) {
 
 function runCommand(cmd, args) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { stdio: "inherit", shell: process.platform === "win32" });
+    const child = spawn(cmd, args, { stdio: "inherit", shell: false });
     child.on("close", (code) => resolve(code === 0));
     child.on("error", () => resolve(false));
   });
@@ -113,7 +123,7 @@ async function installSkill() {
   }
 
   log(`Installing Nansen skill...`);
-  const ok = await runCommand("npx", ["-y", "skills", "add", SKILL_REPO]);
+  const ok = await runCommand(...npxInvocation(["-y", "skills", "add", SKILL_REPO]));
   if (!ok) {
     log(`${YELLOW}Skill installation failed. You can retry with: npx skills add ${SKILL_REPO}${RESET}`);
   }
@@ -122,7 +132,7 @@ async function installSkill() {
 async function testQuery() {
   if (!isLoggedIn()) {
     log();
-    log(`Not logged in yet. Run ${CYAN}nansen login --api-key <key>${RESET} to authenticate.`);
+    log(`Not logged in yet. Run ${CYAN}nansen login --human${RESET} to authenticate.`);
     log(`Get your API key at: ${CYAN}https://app.nansen.ai/auth/agent-setup${RESET}`);
     return;
   }
@@ -146,7 +156,7 @@ async function testQuery() {
     log(`${GREEN}✓${RESET} All set! Run ${CYAN}nansen help${RESET} to see all available commands.`);
   } else {
     log();
-    log(`${YELLOW}Query failed. Check your API key with: nansen login --api-key <key>${RESET}`);
+    log(`${YELLOW}Query failed. Check your API key with: nansen auth status${RESET}`);
   }
 }
 
@@ -162,7 +172,7 @@ async function main() {
     log(`${BOLD}Nansen CLI installed!${RESET}`);
     log();
     log(`Tip: Run '${CYAN}npx skills add ${SKILL_REPO}${RESET}' to install the Nansen AI coding skill.`);
-    log(`Tip: Run '${CYAN}nansen login --api-key <key>${RESET}' to authenticate.`);
+    log(`Tip: Run '${CYAN}nansen login --human${RESET}' to authenticate.`);
     log(`Tip: To trade, first create a wallet with '${CYAN}nansen wallet create${RESET}', then quote with '${CYAN}nansen trade quote --chain solana --from SOL --to USDC --amount 1000000000${RESET}' and execute with '${CYAN}nansen trade execute --quote <id>${RESET}'.`);
     return;
   }

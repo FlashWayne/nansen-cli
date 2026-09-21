@@ -113,7 +113,10 @@ export class AlertsDaemon extends EventEmitter {
     this._pingTimer = null;
     this._pongTimer = null;
     this._cancelReconnectWait = null;
-    this._state = readJsonSafe(this.stateFile) ?? {};
+    const storedState = readJsonSafe(this.stateFile);
+    this._state = storedState && typeof storedState === 'object' && !Array.isArray(storedState)
+      ? storedState
+      : {};
     const recentAlertKeys = Array.isArray(this._state.recentAlertKeys)
       ? this._state.recentAlertKeys.filter((key) => typeof key === 'string').slice(-RECENT_ALERT_LIMIT)
       : [];
@@ -362,9 +365,11 @@ export class AlertsDaemon extends EventEmitter {
 
   async _fetchPastAlerts(since) {
     this.log('info', `Backfilling since ${since}`);
-    const url = `${this.restUrl}?since=${encodeURIComponent(since)}&limit=50`;
+    const url = new URL(this.restUrl);
+    url.searchParams.set('since', since);
+    url.searchParams.set('limit', '50');
 
-    const res = await this._fetch(url, {
+    const res = await this._fetch(url.toString(), {
       headers: { apikey: this.apiKey },
     });
 

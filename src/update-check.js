@@ -9,6 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import childProcess from 'child_process';
 import { fileURLToPath } from 'url';
+import { compareSemver } from './semver.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const CONFIG_DIR = path.join(process.env.HOME || process.env.USERPROFILE || '', '.nansen');
@@ -18,14 +19,21 @@ const PACKAGE_NAME = 'nansen-cli';
 
 /**
  * Compare two semver strings. Returns true if latest > current.
+ * Exported so `nansen doctor` reports upgrade state with identical semantics.
+ *
+ * Delegates to the shared compareSemver (src/semver.js, also used by `nansen
+ * changelog --since`) instead of hand-rolling its own parser. The previous
+ * inline parser here had the same bug compareSemver used to have: a version
+ * string with fewer than 3 components (e.g. a hand-edited or truncated cache
+ * file) parsed its missing component as `undefined`, and `>` is always
+ * `false` against `undefined` in both directions — so a partial version
+ * always read as "not newer", never "newer". In practice both `latest` (from
+ * the npm registry) and `current` (from this package's own version) are
+ * always full x.y.z today, so this couldn't misfire yet — but it's the same
+ * defect class, so it's fixed the same way rather than left as a landmine.
  */
-function isNewer(latest, current) {
-  const parse = v => v.replace(/^v/, '').split('.').map(Number);
-  const [lM, lm, lp] = parse(latest);
-  const [cM, cm, cp] = parse(current);
-  if (lM !== cM) return lM > cM;
-  if (lm !== cm) return lm > cm;
-  return lp > cp;
+export function isNewer(latest, current) {
+  return compareSemver(latest, current) > 0;
 }
 
 const LAST_VERSION_FILE = path.join(CONFIG_DIR, 'last-version.json');
@@ -84,6 +92,54 @@ export function getUpdateNotification(currentVersion) {
   }
 }
 
+const REGISTRY_URL = `https://registry.npmjs.org/${PACKAGE_NAME}/latest`;
+
+/**
+ * Build the Node source run by the detached child. It fetches the latest
+ * version and writes it to `file` atomically: the JSON is written to a
+ * pid-scoped temp file, then renamed over the target. rename(2) is atomic on
+ * POSIX, so a concurrent `nansen` reader always sees either the old file or the
+ * fully-written new one — never a truncated/empty file.
+ *
+ * The URL is injectable as the third argument, which is how the tests point the
+ * child at a local server. It defaults to the npm registry.
+ */
+export function buildCheckScript(dir, file, url = REGISTRY_URL) {
+  return `
+    const url = ${JSON.stringify(url)};
+    const http = require(url.startsWith('https:') ? 'https' : 'http');
+    const fs = require('fs');
+    const dir = ${JSON.stringify(dir)};
+    const file = ${JSON.stringify(file)};
+    const req = http.get(url, { timeout: 5000 }, (res) => {
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        return;
+      }
+
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => {
+        try {
+          const { version } = JSON.parse(body);
+          if (typeof version !== 'string' || version.trim() === '') return;
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { mode: 0o700, recursive: true });
+          const tmp = file + '.' + process.pid + '.tmp';
+          try {
+            fs.writeFileSync(tmp, JSON.stringify({ latest: version, checkedAt: Date.now() }));
+            fs.renameSync(tmp, file);
+          } catch (e) {
+            try { fs.unlinkSync(tmp); } catch {}
+            throw e;
+          }
+        } catch {}
+      });
+    });
+    req.on('error', () => {});
+    req.setTimeout(5000, () => req.destroy());
+  `;
+}
+
 /**
  * If the cache is missing or stale, spawn a detached background process to refresh it.
  */
@@ -97,29 +153,7 @@ export function scheduleUpdateCheck() {
       if (checkedAt && Date.now() - checkedAt < STALE_MS) return;
     }
 
-    // Inline script executed by the detached child
-    const script = `
-      const https = require('https');
-      const fs = require('fs');
-      const path = require('path');
-      const dir = ${JSON.stringify(CONFIG_DIR)};
-      const file = ${JSON.stringify(CACHE_FILE)};
-      const req = https.get('https://registry.npmjs.org/${PACKAGE_NAME}/latest', { timeout: 5000 }, (res) => {
-        let body = '';
-        res.on('data', c => body += c);
-        res.on('end', () => {
-          try {
-            const { version } = JSON.parse(body);
-            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { mode: 0o700, recursive: true });
-            fs.writeFileSync(file, JSON.stringify({ latest: version, checkedAt: Date.now() }));
-          } catch {}
-        });
-      });
-      req.on('error', () => {});
-      req.setTimeout(5000, () => req.destroy());
-    `;
-
-    const child = childProcess.spawn(process.execPath, ['-e', script], {
+    const child = childProcess.spawn(process.execPath, ['-e', buildCheckScript(CONFIG_DIR, CACHE_FILE)], {
       detached: true,
       stdio: 'ignore'
     });

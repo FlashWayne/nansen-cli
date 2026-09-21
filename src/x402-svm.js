@@ -6,6 +6,8 @@
 import crypto from 'crypto';
 import { base58Encode, base58DecodePubkey } from './wallet.js';
 import { encodeCompactU16, deriveATA as _deriveATA } from './transfer.js';
+import { resolvePaymentAmount, resolvePayTo } from './x402-policy.js';
+import { SOLANA_MAINNET_NETWORK } from './x402-tokens.js';
 
 // ============= Constants =============
 
@@ -32,9 +34,13 @@ export function deriveATA(ownerBase58, mintBase58, tokenProgramBase58 = TOKEN_PR
 
 /**
  * Build a Solana MessageV0 from accounts and instructions.
- * Simplified builder for x402 payment transactions.
+ * feePayer is always placed at account index 0, forced signer+writable,
+ * regardless of whether an instruction references it directly.
+ * Returns numRequiredSignatures alongside the bytes since it's read back out
+ * of the header to size the signature-placeholder slots of the wrapping
+ * unsigned transaction (see callers).
  */
-function buildMessageV0({ feePayer, instructions, recentBlockhash, accounts: _accounts }) {
+export function buildMessageV0({ feePayer, instructions, recentBlockhash, accounts: _accounts }) {
   // All unique accounts in order: feePayer first, then signers, then rest
   const accountMap = new Map();
   const feePayerKey = feePayer;
@@ -129,10 +135,10 @@ function buildMessageV0({ feePayer, instructions, recentBlockhash, accounts: _ac
     parts.push(ix.data);
   }
 
-  // Address table lookups (empty for our use case)
+  // Address table lookups (empty — all accounts referenced statically above)
   parts.push(encodeCompactU16(0));
 
-  return Buffer.concat(parts);
+  return { messageBytes: Buffer.concat(parts), numRequiredSignatures };
 }
 
 // ============= Ed25519 Signing =============
@@ -176,8 +182,8 @@ export function buildUnsignedSvmTransaction(
   }
 
   const mint = requirements.asset;
-  const amount = BigInt(requirements.amount);
-  const payTo = requirements.pay_to || requirements.payTo;
+  const amount = BigInt(resolvePaymentAmount(requirements));
+  const payTo = resolvePayTo(requirements);
 
   // Derive ATAs
   const sourceATA = deriveATA(walletAddress, mint, tokenProgram);
@@ -231,7 +237,7 @@ export function buildUnsignedSvmTransaction(
     },
   ];
 
-  const messageBytes = buildMessageV0({
+  const { messageBytes } = buildMessageV0({
     feePayer: feePayerStr,
     instructions,
     recentBlockhash,
@@ -306,31 +312,73 @@ export function createSvmPaymentPayload(
  * Fetch recent blockhash from Solana RPC.
  */
 export async function fetchRecentBlockhash(rpcUrl = 'https://api.mainnet-beta.solana.com') {
-  const response = await fetch(rpcUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'getLatestBlockhash',
-      params: [{ commitment: 'finalized' }],
-    }),
-  });
-  const data = await response.json();
-  return data.result.value.blockhash;
+  let response;
+  try {
+    response = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getLatestBlockhash',
+        params: [{ commitment: 'finalized' }],
+      }),
+    });
+  } catch (err) {
+    throw new Error(
+      `Solana RPC unavailable while fetching a recent blockhash. Retry or configure a different RPC endpoint. ${String(err.message ?? err)}`,
+      { cause: err }
+    );
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(
+      `Solana RPC returned HTTP ${response.status} while fetching a recent blockhash. Retry or configure a different RPC endpoint. ${text.slice(0, 100)}`
+    );
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error(
+      'Solana RPC returned an invalid response while fetching a recent blockhash. Retry or configure a different RPC endpoint.'
+    );
+  }
+
+  if (data?.error) {
+    const detail =
+      data.error.message != null ? String(data.error.message)
+      : data.error.code  != null ? String(data.error.code)
+      : 'unknown RPC error';
+    throw new Error(
+      `Solana RPC failed while fetching a recent blockhash: ${detail}. Retry or configure a different RPC endpoint.`
+    );
+  }
+
+  const blockhash = data?.result?.value?.blockhash;
+  if (typeof blockhash !== 'string' || blockhash.length === 0) {
+    throw new Error(
+      'Solana RPC returned no recent blockhash. Retry or configure a different RPC endpoint.'
+    );
+  }
+
+  return blockhash;
 }
 
 /**
  * Get RPC URL for a Solana network identifier.
  */
 export function getSolanaRpcUrl(network) {
-  if (network.includes('devnet') || network === 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1') {
-    return 'https://api.devnet.solana.com';
-  }
-  if (network.includes('testnet') || network === 'solana:4uhcVJyU9pJkvQyS88uRDiswHXSCkY3z') {
-    return 'https://api.testnet.solana.com';
-  }
-  return 'https://api.mainnet-beta.solana.com';
+  if (network === SOLANA_MAINNET_NETWORK) return 'https://api.mainnet-beta.solana.com';
+  // Devnet/testnet resolve for tooling (e.g. balance checks), but the x402 pay
+  // path never reaches them: SVM_X402_TOKENS is mainnet-only, so the policy layer
+  // refuses a devnet/testnet requirement before signing. Adding a non-mainnet
+  // token entry would silently enable signing here — revisit this gate if you do.
+  if (network === 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1') return 'https://api.devnet.solana.com';
+  if (network === 'solana:4uhcVJyU9pJkvQyS88uRDiswHXSCkY3z') return 'https://api.testnet.solana.com';
+  throw new Error(`Unsupported Solana network for x402: ${network}`);
 }
 
 /**

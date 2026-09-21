@@ -10,6 +10,7 @@ import fs from "fs";
 import path from "path";
 import { parsePaymentRequirements } from "./x402.js";
 import { isEvmNetwork } from "./x402-evm.js";
+import { evaluatePaymentRequirement, resolvePaymentAmount, resolvePayTo } from "./x402-policy.js";
 import {
   isSvmNetwork,
   getSolanaRpcUrl,
@@ -49,10 +50,20 @@ export class PrivyClient {
       "Content-Type": "application/json",
     };
 
-    const opts = { method, headers };
+    // Never follow a redirect on a request carrying Basic auth / privy-app-id —
+    // a redirect target could otherwise be handed the app credentials.
+    const opts = { method, headers, redirect: "error" };
     if (body) opts.body = JSON.stringify(body);
 
-    const response = await fetch(`${this.baseUrl}${endpoint}`, opts);
+    let response;
+    try {
+      response = await fetch(`${this.baseUrl}${endpoint}`, opts);
+    } catch (err) {
+      // redirect: 'error' rejects with a bare TypeError on any server redirect;
+      // convert it (and genuine network failures) into an actionable message
+      // rather than surfacing an undecorated crash.
+      throw new Error(`Privy API request failed (${method} ${endpoint}): ${err.message}. If PRIVY_* points at a proxy that redirects, use the direct api.privy.io base URL.`, { cause: err });
+    }
 
     if (!response.ok) {
       let msg = `Privy API error: ${response.status}`;
@@ -287,6 +298,11 @@ export async function* createPrivyPaymentSignatures(response, url) {
     const evmWallet = await getPrivyEvmWallet(client);
     if (evmWallet) {
       for (const requirement of evmRequirements) {
+        const decision = evaluatePaymentRequirement(requirement);
+        if (!decision.ok) {
+          console.error(`[x402] ${decision.reason}`);
+          continue;
+        }
         try {
           const typedData = buildEIP712TypedData({
             fromAddress: evmWallet.address,
@@ -301,8 +317,8 @@ export async function* createPrivyPaymentSignatures(response, url) {
 
           const authorization = {
             from: evmWallet.address,
-            to: requirement.payTo,
-            value: (requirement.amount || requirement.maxAmountRequired).toString(),
+            to: resolvePayTo(requirement),
+            value: resolvePaymentAmount(requirement).toString(),
             validAfter: typedData.message.validAfter.toString(),
             validBefore: typedData.message.validBefore.toString(),
             nonce: typedData.message.nonce,
@@ -332,6 +348,11 @@ export async function* createPrivyPaymentSignatures(response, url) {
     const solWallet = await getPrivySolanaWallet(client);
     if (solWallet) {
       for (const requirement of svmRequirements) {
+        const svmDecision = evaluatePaymentRequirement(requirement);
+        if (!svmDecision.ok) {
+          console.error(`[x402] ${svmDecision.reason}`);
+          continue;
+        }
         try {
           const rpcUrl = getSolanaRpcUrl(requirement.network);
           const recentBlockhash = await fetchRecentBlockhash(rpcUrl);

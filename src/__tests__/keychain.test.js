@@ -13,7 +13,7 @@ vi.mock('child_process', () => ({
 }));
 
 import { execFileSync } from 'child_process';
-import { storePassword, retrievePassword, deletePassword, deleteCredentialsFile, resolvePassword } from '../keychain.js';
+import { storePassword, retrievePassword, deletePassword, deleteCredentialsFile, resolvePassword, passwordSource } from '../keychain.js';
 
 describe('keychain', () => {
   let originalPlatform;
@@ -72,6 +72,62 @@ describe('keychain', () => {
       expect(content).toContain('NANSEN_WALLET_PASSWORD_B64=');
       const b64 = content.match(/NANSEN_WALLET_PASSWORD_B64=(.+)/)[1].trim();
       expect(Buffer.from(b64, 'base64').toString('utf8')).toBe('mypassword');
+      if (originalPlatform !== 'win32') {
+        expect(fs.statSync(credPath).mode & 0o777).toBe(0o600);
+      }
+    });
+
+    it.skipIf(process.platform === 'win32')('should tighten permissions when rewriting an existing credentials file on POSIX', () => {
+      setPlatform('linux');
+      execFileSync.mockImplementation(() => { throw new Error('secret-tool unavailable'); });
+
+      const credDir = path.join(tempDir, '.nansen', 'wallets');
+      const credPath = path.join(credDir, '.credentials');
+      fs.mkdirSync(credDir, { recursive: true });
+      fs.writeFileSync(credPath, 'old credentials\n');
+      // writeFileSync's mode is filtered by the process umask, so set and
+      // verify the insecure starting state explicitly.
+      fs.chmodSync(credPath, 0o644);
+      expect(fs.statSync(credPath).mode & 0o777).toBe(0o644);
+
+      expect(storePassword('replacement-password')).toEqual({ stored: true, method: 'file' });
+      expect(fs.statSync(credPath).mode & 0o777).toBe(0o600);
+      expect(retrievePassword()).toEqual({ password: 'replacement-password', source: 'file' });
+    });
+
+    it.skipIf(process.platform === 'win32')('should refuse to overwrite a credentials symlink on POSIX', () => {
+      setPlatform('linux');
+      execFileSync.mockImplementation(() => { throw new Error('secret-tool unavailable'); });
+
+      const credDir = path.join(tempDir, '.nansen', 'wallets');
+      const credPath = path.join(credDir, '.credentials');
+      const targetPath = path.join(tempDir, 'symlink-target');
+      fs.mkdirSync(credDir, { recursive: true });
+      fs.writeFileSync(targetPath, 'leave unchanged\n');
+      fs.symlinkSync(targetPath, credPath);
+
+      expect(storePassword('replacement-password')).toEqual({ stored: false, method: 'none' });
+      expect(fs.readFileSync(targetPath, 'utf8')).toBe('leave unchanged\n');
+    });
+
+    it.skipIf(process.platform === 'win32')('should refuse to overwrite a hard-linked credentials file on POSIX', () => {
+      setPlatform('linux');
+      execFileSync.mockImplementation(() => { throw new Error('secret-tool unavailable'); });
+
+      const credDir = path.join(tempDir, '.nansen', 'wallets');
+      const credPath = path.join(credDir, '.credentials');
+      const victimPath = path.join(tempDir, 'hardlink-victim');
+      fs.mkdirSync(credDir, { recursive: true });
+      fs.writeFileSync(victimPath, 'leave unchanged\n');
+      fs.chmodSync(victimPath, 0o644);
+      // O_NOFOLLOW cannot see this: the link is a second name for the same
+      // regular inode, not a symlink.
+      fs.linkSync(victimPath, credPath);
+      expect(fs.statSync(credPath).nlink).toBe(2);
+
+      expect(storePassword('replacement-password')).toEqual({ stored: false, method: 'none' });
+      expect(fs.readFileSync(victimPath, 'utf8')).toBe('leave unchanged\n');
+      expect(fs.statSync(victimPath).mode & 0o777).toBe(0o644);
     });
 
     it('should fall back to .credentials on unsupported platform', () => {
@@ -213,6 +269,48 @@ describe('keychain', () => {
       setPlatform('freebsd');
       delete process.env.NANSEN_WALLET_PASSWORD;
       expect(resolvePassword()).toBeNull();
+    });
+  });
+
+  describe('passwordSource (metadata-only)', () => {
+    it('reports env without touching the keychain', () => {
+      process.env.NANSEN_WALLET_PASSWORD = 'env-pw';
+      expect(passwordSource()).toBe('env');
+      expect(execFileSync).not.toHaveBeenCalled();
+    });
+
+    it('reports keychain on macOS without requesting the secret', () => {
+      setPlatform('darwin');
+      delete process.env.NANSEN_WALLET_PASSWORD;
+      execFileSync.mockReturnValue(Buffer.from(''));
+      expect(passwordSource()).toBe('keychain');
+      // Attribute lookup only — the -w flag (print password) must be absent
+      const args = execFileSync.mock.calls[0][1];
+      expect(args).toContain('find-generic-password');
+      expect(args).not.toContain('-w');
+    });
+
+    it('uses secret-tool search (attributes) rather than lookup (secret) on Linux', () => {
+      setPlatform('linux');
+      delete process.env.NANSEN_WALLET_PASSWORD;
+      execFileSync.mockReturnValue(Buffer.from('[/org/freedesktop/secrets/collection/login/1]\nlabel = nansen-cli\n'));
+      expect(passwordSource()).toBe('keychain');
+      expect(execFileSync.mock.calls[0][1][0]).toBe('search');
+    });
+
+    it('reports file by pattern-matching the credentials file without decoding it', () => {
+      setPlatform('freebsd');
+      delete process.env.NANSEN_WALLET_PASSWORD;
+      const walletsDir = path.join(tempDir, '.nansen', 'wallets');
+      fs.mkdirSync(walletsDir, { recursive: true });
+      fs.writeFileSync(path.join(walletsDir, '.credentials'), 'NANSEN_WALLET_PASSWORD_B64=cHc=\n');
+      expect(passwordSource()).toBe('file');
+    });
+
+    it('returns null when no source exists', () => {
+      setPlatform('freebsd');
+      delete process.env.NANSEN_WALLET_PASSWORD;
+      expect(passwordSource()).toBeNull();
     });
   });
 });
