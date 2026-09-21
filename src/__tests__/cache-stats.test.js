@@ -263,8 +263,14 @@ describe('cache clear', () => {
     writeResponseEntry(CACHE_KEY, { data: [1] });
     const { clearCaches } = await freshModule('../cache-inspect.js');
 
-    expect(() => clearCaches('everything')).toThrow(/Unknown cache target/);
-    expect(() => clearCaches('../..')).toThrow(/Unknown cache target/);
+    for (const target of ['everything', '../..']) {
+      let error;
+      try { clearCaches(target); } catch (caught) { error = caught; }
+      expect(error).toMatchObject({
+        code: 'INVALID_PARAMS',
+        message: expect.stringMatching(/Unknown cache clear target/),
+      });
+    }
     expect(fs.existsSync(path.join(responseCacheDir(), `${CACHE_KEY}.json`))).toBe(true);
   });
 
@@ -369,9 +375,10 @@ describe('cache command', () => {
   it('rejects an unrecognised clear target with an actionable error', async () => {
     writeResponseEntry(CACHE_KEY, { data: [1] });
 
-    await expect(runCacheCommand(['clear', 'wallets'])).rejects.toThrow(
-      /Unknown cache clear target: wallets\. Use one of: responses, cost-map, update-check, all/,
-    );
+    await expect(runCacheCommand(['clear', 'wallets'])).rejects.toMatchObject({
+      code: 'INVALID_PARAMS',
+      message: 'Unknown cache clear target: wallets. Use one of: responses, cost-map, update-check, all',
+    });
     expect(fs.existsSync(path.join(responseCacheDir(), `${CACHE_KEY}.json`))).toBe(true);
   });
 

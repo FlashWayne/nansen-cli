@@ -22,7 +22,7 @@ import fs from 'fs';
 import { getUpdateNotification, getUpgradeNotice, scheduleUpdateCheck } from './update-check.js';
 import { getAuthStatus, runDoctorChecks, runConnectivityChecks, formatDoctorReport } from './doctor.js';
 import { refreshCostMapIfStale, getCostForEndpoint, creditsCharged } from './cost-cache.js';
-import { collectCacheStats, clearCaches, formatCacheStats, formatCacheClear, CLEAR_TARGETS } from './cache-inspect.js';
+import { collectCacheStats, clearCaches, formatCacheStats, formatCacheClear } from './cache-inspect.js';
 import { creditWarning, noticeWarnings } from './response-meta.js';
 import { trackCommandSucceeded, trackCommandFailed } from './telemetry.js';
 import { createRequire } from 'module';
@@ -1450,12 +1450,6 @@ export function buildCommands(deps = {}) {
           // response cache alone — the one cache that is always safely
           // refetchable — and wiping everything requires saying "all".
           const target = args[1] || 'responses';
-          if (!CLEAR_TARGETS.includes(target)) {
-            throw new NansenError(
-              `Unknown cache clear target: ${target}. Use one of: ${CLEAR_TARGETS.join(', ')}`,
-              ErrorCode.INVALID_PARAMS,
-            );
-          }
           log(formatCacheClear(clearCaches(target)));
         },
         'help': () => {
@@ -2162,25 +2156,23 @@ export async function runCLI(rawArgs, deps = {}) {
   const stream = flags.stream || flags.s;
   const csv = options.format === 'csv';
 
-  // Offline commands promise zero network activity. That contract covers the
-  // background update-check fetch and telemetry too, not just the command's
-  // own requests.
+  // Commands in this set promise zero network activity. That includes update
+  // checks, cost-map refreshes and telemetry, not just their primary work.
+  // `cache` belongs here specifically so inspecting or clearing caches cannot
+  // recreate update/telemetry state during the same invocation.
   const isMcpUsage = command === 'mcp' && (subcommand !== 'verify' || flags.help || flags.h);
-  // `completion` renders from the checked-in schema — no network, and its
-  // stdout is piped straight into a shell, so keep the update check out of it.
-  const isOfflineCommand = command === 'auth' || (command === 'doctor' && flags.offline) || isMcpUsage || command === 'completion' || command === 'cache';
-  // `cache` reports on and deletes cache files. The background update check
-  // writes ~/.nansen/update-check.json and the cost map refresh writes
-  // ~/.nansen/cost-map.json — either would repopulate a cache the user just
-  // measured or cleared, so neither runs for this command.
-  const mayRefreshCaches = command !== 'cache';
+  const isOfflineCommand = command === 'auth'
+    || (command === 'doctor' && flags.offline)
+    || isMcpUsage
+    || command === 'completion'
+    || command === 'cache';
   const trackSucceeded = isOfflineCommand ? async () => {} : trackCommandSucceeded;
   const trackFailed = isOfflineCommand ? async () => {} : trackCommandFailed;
 
   // Update check (read cached result + schedule background refresh)
   const updateNotification = isOfflineCommand ? null : getUpdateNotification(VERSION);
   const upgradeNotice = isOfflineCommand ? null : getUpgradeNotice(VERSION);
-  if (!isOfflineCommand && mayRefreshCaches) scheduleUpdateCheck();
+  if (!isOfflineCommand) scheduleUpdateCheck();
   const notify = () => {
     if (upgradeNotice) errorOutput(upgradeNotice);
     if (updateNotification) errorOutput(updateNotification);
@@ -2205,7 +2197,7 @@ export async function runCLI(rawArgs, deps = {}) {
   if (command === 'help' || flags.help || flags.h) {
     // Help for an offline command still owes the zero-network contract: the
     // cost-map refresh fetches the OpenAPI spec and writes ~/.nansen/cost-map.json.
-    if (!isOfflineCommand && mayRefreshCaches) await refreshCostMapIfStale();
+    if (!isOfflineCommand) await refreshCostMapIfStale();
     // Check for subcommand-specific help: nansen <command> <subcommand> --help
     if (flags.help || flags.h) {
       // Handle 'research <category> <sub> --help' (3-level)

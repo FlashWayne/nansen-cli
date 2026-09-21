@@ -22,7 +22,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { getCacheDir, getConfigDir, DEFAULT_CACHE_TTL } from './api.js';
+import { getCacheDir, getConfigDir, DEFAULT_CACHE_TTL, NansenError, ErrorCode } from './api.js';
 import { getCostMapFile, COST_MAP_TTL_MS } from './cost-cache.js';
 import { getUpdateCheckFile, UPDATE_CHECK_TTL_MS } from './update-check.js';
 
@@ -117,6 +117,10 @@ function listDirEntries(dir, { readMetadata = false } = {}) {
   }
   const entries = [];
   for (const name of names) {
+    // `name` comes from this directory's own listing, not from a caller. The
+    // strict digest shape both identifies files written by api.js and prevents
+    // path separators or traversal segments from reaching path.join(). The
+    // lstat below then rejects a final-component symlink before any read/delete.
     if (!RESPONSE_ENTRY.test(name)) continue;
     const file = path.join(dir, name);
     try {
@@ -207,7 +211,10 @@ export function collectCacheStats({ responseTtlSeconds = DEFAULT_CACHE_TTL, now 
  */
 export function clearCaches(target) {
   if (!CLEAR_TARGETS.includes(target)) {
-    throw new Error(`Unknown cache target: ${target}. Use one of: ${CLEAR_TARGETS.join(', ')}`);
+    throw new NansenError(
+      `Unknown cache clear target: ${target}. Use one of: ${CLEAR_TARGETS.join(', ')}`,
+      ErrorCode.INVALID_PARAMS,
+    );
   }
 
   const wanted = target === 'all' ? CACHE_NAMES : [target];
