@@ -90,6 +90,7 @@ export class AlertsDaemon extends EventEmitter {
    * @param {function} [opts.log]        Custom log function(level, message)
    * @param {function} [opts.WebSocket]  Injected WebSocket class (for testing)
    * @param {function} [opts.fetchFn]    Injected fetch (for testing)
+   * @param {function} [opts.spawnFn]    Injected child-process spawn (for testing)
    */
   constructor(opts = {}) {
     super();
@@ -106,6 +107,7 @@ export class AlertsDaemon extends EventEmitter {
     this._logFn = opts.log ?? null;
     this._WebSocket = opts.WebSocket ?? null;
     this._fetch = opts.fetchFn ?? globalThis.fetch;
+    this._spawn = opts.spawnFn ?? spawn;
 
     this._ws = null;
     this._running = false;
@@ -190,7 +192,7 @@ export class AlertsDaemon extends EventEmitter {
   async _connect() {
     const WS = this._WebSocket ?? WebSocket;
 
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const ws = new WS(this.wsUrl, {
         headers: { apikey: this.apiKey },
         handshakeTimeout: HANDSHAKE_TIMEOUT_MS,
@@ -239,10 +241,7 @@ export class AlertsDaemon extends EventEmitter {
         try {
           if (typeof ws.terminate === 'function') ws.terminate();
           else ws.close();
-        } catch {
-          reject(err);
-          return;
-        }
+        } catch { /* the reconnect loop handles this failed connection */ }
         if (this._ws === ws) {
           this._clearTimers();
           this._ws = null;
@@ -334,9 +333,9 @@ export class AlertsDaemon extends EventEmitter {
     }
 
     try {
-      const child = spawn('/bin/sh', ['-c', cmd], {
+      const child = this._spawn('/bin/sh', ['-c', cmd], {
         env,
-        stdio: ['pipe', 'inherit', 'inherit'],
+        stdio: [this.actionEnv ? 'ignore' : 'pipe', 'inherit', 'inherit'],
       });
 
       if (!this.actionEnv) {

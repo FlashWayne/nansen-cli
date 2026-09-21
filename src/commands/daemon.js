@@ -7,6 +7,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'url';
 import { AlertsDaemon } from '../daemon/alerts-daemon.js';
 
 const NANSEN_DIR = path.join(os.homedir(), '.nansen');
@@ -17,6 +18,7 @@ const STOP_POLL_INTERVAL_MS = 50;
 const STOP_POLL_ATTEMPTS = 100;
 const STARTUP_GRACE_MS = 250;
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]']);
+const CLI_ENTRYPOINT = fileURLToPath(new URL('../index.js', import.meta.url));
 
 const DAEMON_HELP = `nansen alerts daemon — Listen to Smart Alert events in real-time
 
@@ -38,6 +40,10 @@ OPTIONS:
   --state-file <path>     Path to state JSON (default: ~/.nansen/alerts-daemon-state.json)
   --pid-file <path>       Path to PID file (default: ~/.nansen/alerts-daemon.pid)
   --log-file <path>       Path to log file (default: ~/.nansen/alerts-daemon.log)
+
+BACKGROUND CONTEXT:
+  start reloads authentication from the inherited environment or ~/.nansen/config.json.
+  NANSEN_BASE_URL does not infer streaming endpoints; use --ws-url/--rest-url.
 
 EXAMPLES:
   # Print all alerts as JSON (pipe to jq, agent, etc.)
@@ -112,6 +118,27 @@ export function resolveRestUrl(wsUrl, explicitRestUrl, backfill) {
   url.search = '';
   url.hash = '';
   return url.toString();
+}
+
+/**
+ * Reconstruct the detached daemon invocation from the options the daemon
+ * actually supports. Do not reuse process.argv: it can contain wrapper or
+ * parent-command arguments when the CLI is embedded. Authentication, HOME
+ * configuration, and NANSEN_BASE_URL are preserved through the inherited env.
+ */
+export function buildDaemonChildArgv(options, flags, pidFile, logFile) {
+  return [
+    CLI_ENTRYPOINT,
+    'alerts', 'daemon', 'run',
+    ...(options['ws-url'] ? ['--ws-url', options['ws-url']] : []),
+    ...(options['rest-url'] ? ['--rest-url', options['rest-url']] : []),
+    ...(options.action ? ['--action', options.action] : []),
+    ...(flags['action-env'] ? ['--action-env'] : []),
+    ...(flags['no-backfill'] ? ['--no-backfill'] : []),
+    ...(options['state-file'] ? ['--state-file', options['state-file']] : []),
+    '--pid-file', pidFile,
+    '--log-file', logFile,
+  ];
 }
 
 function acquireLifecycleLock(pidFile, killFn) {
@@ -242,20 +269,9 @@ export function buildDaemonCommand(deps = {}) {
 
           // Spawn detached child
           const spawn = spawnFn ?? (await import('child_process')).spawn;
-          const argv = [
-            ...process.argv.slice(0, 2), // node + script path
-            'alerts', 'daemon', 'run',
-            ...(options['ws-url'] ? ['--ws-url', options['ws-url']] : []),
-            ...(options['rest-url'] ? ['--rest-url', options['rest-url']] : []),
-            ...(options.action ? ['--action', options.action] : []),
-            ...(flags['action-env'] ? ['--action-env'] : []),
-            ...(flags['no-backfill'] ? ['--no-backfill'] : []),
-            ...(options['state-file'] ? ['--state-file', options['state-file']] : []),
-            '--pid-file', pidFile,
-            '--log-file', logFile,
-          ];
+          const argv = buildDaemonChildArgv(options, flags, pidFile, logFile);
 
-          const child = spawn(process.execPath, argv.slice(1), {
+          const child = spawn(process.execPath, argv, {
             detached: true,
             stdio: 'ignore',
             env: process.env,

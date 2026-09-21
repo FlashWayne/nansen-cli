@@ -11,10 +11,12 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
+import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { buildDaemonCommand, resolveRestUrl } from '../commands/daemon.js';
+import { buildDaemonChildArgv, buildDaemonCommand, resolveRestUrl } from '../commands/daemon.js';
 import { AlertsDaemon, interpolateCommand } from '../daemon/alerts-daemon.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -174,6 +176,63 @@ describe('AlertsDaemon', () => {
     await expect(daemon._connect()).resolves.toBeUndefined();
     expect(socket.terminate).toHaveBeenCalledOnce();
     expect(daemon._ws).toBeNull();
+  });
+
+  it('settles a failed connection when terminating the socket throws', async () => {
+    class ThrowingTerminateMockWS extends EventEmitter {
+      constructor() {
+        super();
+        this.terminate = vi.fn(() => { throw new Error('already destroyed'); });
+        setImmediate(() => this.emit('error', new Error('DNS lookup failed')));
+      }
+    }
+
+    const { daemon } = makeDaemon({ WebSocket: ThrowingTerminateMockWS });
+
+    await expect(daemon._connect()).resolves.toBeUndefined();
+    expect(daemon._ws).toBeNull();
+  });
+
+  it('does not leave action stdin open in environment mode', () => {
+    const child = new EventEmitter();
+    const spawnFn = vi.fn(() => child);
+    const { daemon } = makeDaemon({
+      action: 'handler',
+      actionEnv: true,
+      spawnFn,
+    });
+    const alert = makeAlert();
+
+    daemon._dispatchAlert(alert);
+
+    expect(spawnFn).toHaveBeenCalledWith('/bin/sh', ['-c', 'handler'], expect.objectContaining({
+      stdio: ['ignore', 'inherit', 'inherit'],
+      env: expect.objectContaining({ NANSEN_ALERT: JSON.stringify(alert) }),
+    }));
+  });
+
+  it('delivers EOF to an environment-mode action instead of hanging', async () => {
+    let closed;
+    const spawnFn = (...args) => {
+      const child = spawn(...args);
+      closed = new Promise((resolve, reject) => {
+        child.once('close', resolve);
+        child.once('error', reject);
+      });
+      return child;
+    };
+    const { daemon } = makeDaemon({
+      action: 'cat >/dev/null',
+      actionEnv: true,
+      spawnFn,
+    });
+
+    daemon._dispatchAlert(makeAlert());
+
+    await expect(Promise.race([
+      closed,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('action hung waiting for stdin EOF')), 1000)),
+    ])).resolves.toBe(0);
   });
 
   it('emits "alert" event and writes JSON to stdout', async () => {
@@ -473,6 +532,33 @@ describe('AlertsDaemon', () => {
 });
 
 describe('daemon command', () => {
+  it('builds a canonical daemon-only child invocation', () => {
+    const argv = buildDaemonChildArgv({
+      action: 'handler --mode env',
+      'ws-url': 'wss://custom.example/v1/smart-alert/stream',
+      'rest-url': 'https://custom.example/past-alerts',
+      'state-file': '/tmp/state.json',
+    }, {
+      'action-env': true,
+      'no-backfill': true,
+      pretty: true,
+    }, '/tmp/daemon.pid', '/tmp/daemon.log');
+
+    const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+    const packageJson = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8'));
+    expect(argv[0]).toBe(path.resolve(packageRoot, packageJson.bin.nansen));
+    expect(argv.slice(1)).toEqual([
+      'alerts', 'daemon', 'run',
+      '--ws-url', 'wss://custom.example/v1/smart-alert/stream',
+      '--rest-url', 'https://custom.example/past-alerts',
+      '--action', 'handler --mode env',
+      '--action-env', '--no-backfill',
+      '--state-file', '/tmp/state.json',
+      '--pid-file', '/tmp/daemon.pid',
+      '--log-file', '/tmp/daemon.log',
+    ]);
+    expect(argv).not.toContain('--pretty');
+  });
   it('derives backfill safely or requires an explicit REST URL', () => {
     expect(resolveRestUrl(
       'wss://custom.example/v1/smart-alert/stream?ignored=yes',
