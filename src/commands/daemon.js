@@ -346,27 +346,38 @@ export function buildDaemonCommand(deps = {}) {
             log(`Daemon already running (PID ${pid})`);
             return;
           }
+          removePidFileIfMatches(pidFile, pid);
 
-          // Spawn detached child
           const spawn = spawnFn ?? (await import('child_process')).spawn;
-          const argv = buildDaemonChildArgv(options, flags, logFile);
+          // Reserve the PID path before spawning so an exclusive 0600 file is
+          // guaranteed and a file-creation failure cannot orphan a child.
+          const pidFd = fs.openSync(pidFile, 'wx', 0o600);
+          const pidIdentity = fs.fstatSync(pidFd);
 
-          const child = spawn(process.execPath, argv, {
-            detached: true,
-            stdio: 'ignore',
-            env: process.env,
-          });
-          if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
-            // A failed spawn may emit `error` after returning a pid-less child.
-            // Attach a listener so the actionable CLI error below is not followed
-            // by an unhandled EventEmitter error.
-            child.once?.('error', () => {});
-            throw new Error('Failed to start daemon: child process did not provide a valid PID');
+          const argv = buildDaemonChildArgv(options, flags, logFile);
+          let child;
+          try {
+            child = spawn(process.execPath, argv, {
+              detached: true,
+              stdio: 'ignore',
+              env: process.env,
+            });
+            if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
+              // A failed spawn may emit `error` after returning a pid-less child.
+              // Attach a listener so the actionable CLI error below is not followed
+              // by an unhandled EventEmitter error.
+              child.once?.('error', () => {});
+              throw new Error('Failed to start daemon: child process did not provide a valid PID');
+            }
+            fs.writeFileSync(pidFd, String(child.pid));
+          } catch (err) {
+            child?.kill?.();
+            unlinkIfSameIdentity(pidFile, pidIdentity);
+            throw err;
+          } finally {
+            fs.closeSync(pidFd);
           }
           child.unref();
-
-          fs.writeFileSync(pidFile, String(child.pid), { mode: 0o600 });
-          fs.chmodSync(pidFile, 0o600);
           await waitFn(STARTUP_GRACE_MS);
           if (!isProcessRunning(child.pid, killFn)) {
             removePidFileIfMatches(pidFile, child.pid);

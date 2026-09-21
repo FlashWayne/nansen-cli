@@ -107,6 +107,15 @@ describe('AlertsDaemon', () => {
     expect(command).toBe('handler SafeName--extra-argument abctouch/tmp/pwned');
   });
 
+  it('normalizes valid firedAt offsets and safely falls back for invalid timestamps', () => {
+    expect(interpolateCommand('handler {firedAt}', {
+      firedAt: '2026-03-20T11:00:00.123+01:00',
+    })).toBe('handler 2026-03-20T10:00:00.123Z');
+    expect(interpolateCommand('handler {firedAt}', {
+      firedAt: 'not a date;$(touch /tmp/x)',
+    })).toBe('handler notadatetouch/tmp/x');
+  });
+
   it('ignores non-object messages', () => {
     const { daemon } = makeDaemon();
     expect(() => daemon._handleMessage(null)).not.toThrow();
@@ -191,6 +200,51 @@ describe('AlertsDaemon', () => {
 
     await expect(daemon._connect()).resolves.toBeUndefined();
     expect(daemon._ws).toBeNull();
+  });
+
+  it('does not dispatch stale backfill after a rapid close and reconnect', async () => {
+    const sockets = [];
+    class ControlledWS extends EventEmitter {
+      constructor() {
+        super();
+        this.readyState = 1;
+        this.send = vi.fn();
+        this.close = vi.fn((code) => this.emit('close', code ?? 1000, ''));
+        this.terminate = vi.fn(() => this.emit('close', 1006, ''));
+        sockets.push(this);
+      }
+    }
+    let resolveFirstFetch;
+    const firstFetch = new Promise((resolve) => { resolveFirstFetch = resolve; });
+    const fetchFn = vi.fn()
+      .mockImplementationOnce(() => firstFetch)
+      .mockResolvedValue({ ok: true, json: async () => ({ alerts: [] }) });
+    const { daemon } = makeDaemon({ WebSocket: ControlledWS, fetchFn, backfill: true });
+    daemon._state.lastAlertAt = '2026-03-20T10:00:00Z';
+    const seen = [];
+    daemon.on('alert', (alert) => seen.push(alert.alertId));
+
+    const firstConnection = daemon._connect();
+    sockets[0].emit('open');
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(1));
+    sockets[0].emit('close', 1006, 'rapid close');
+    await firstConnection;
+
+    const secondConnection = daemon._connect();
+    sockets[1].emit('open');
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(2));
+    resolveFirstFetch({
+      ok: true,
+      json: async () => ({
+        alerts: [makeAlert({ alertId: 'stale-backfill', firedAt: '2026-03-20T10:00:01Z' })],
+      }),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(fetchFn.mock.calls[0][1].signal.aborted).toBe(true);
+    expect(seen).toEqual([]);
+    sockets[1].emit('close', 1000, 'done');
+    await secondConnection;
   });
 
   it('does not leave action stdin open in environment mode', () => {
@@ -848,6 +902,7 @@ describe('daemon command', () => {
 
     try {
       await command(['start'], null, {}, { 'pid-file': pidFile });
+      expect(fs.statSync(pidFile).mode & 0o777).toBe(0o600);
       expect(fs.existsSync(lockFile)).toBe(false);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });

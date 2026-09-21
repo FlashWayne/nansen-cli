@@ -58,11 +58,16 @@ function readJsonSafe(filePath) {
  * This prevents any injection from alert content into the shell command.
  */
 export function interpolateCommand(template, alert) {
+  const firedAt = String(alert.firedAt ?? '');
+  const firedAtTime = Date.parse(firedAt);
+  const normalizedFiredAt = Number.isFinite(firedAtTime)
+    ? new Date(firedAtTime).toISOString()
+    : sanitizeShell(firedAt);
   return template
     .replace(/\{alertId\}/g, sanitizeShell(alert.alertId ?? ''))
     .replace(/\{alertName\}/g, sanitizeShell(alert.alertName ?? ''))
     .replace(/\{alertType\}/g, sanitizeShell(alert.alertType ?? ''))
-    .replace(/\{firedAt\}/g, sanitizeShell(alert.firedAt ?? ''));
+    .replace(/\{firedAt\}/g, normalizedFiredAt);
 }
 
 /**
@@ -117,6 +122,7 @@ export class AlertsDaemon extends EventEmitter {
     this._pingTimer = null;
     this._pongTimer = null;
     this._cancelReconnectWait = null;
+    this._connectionGeneration = 0;
     const storedState = readJsonSafe(this.stateFile);
     this._state = storedState && typeof storedState === 'object' && !Array.isArray(storedState)
       ? storedState
@@ -193,29 +199,49 @@ export class AlertsDaemon extends EventEmitter {
 
   async _connect() {
     const WS = this._WebSocket ?? WebSocket;
+    const generation = ++this._connectionGeneration;
 
     return new Promise((resolve) => {
+      let settled = false;
+      const backfillController = new AbortController();
       const ws = new WS(this.wsUrl, {
         headers: { apikey: this.apiKey },
         handshakeTimeout: HANDSHAKE_TIMEOUT_MS,
       });
       this._ws = ws;
+      const isCurrent = () => !settled && this._connectionGeneration === generation && this._ws === ws;
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        backfillController.abort();
+        if (this._connectionGeneration === generation) this._connectionGeneration++;
+        if (this._ws === ws) {
+          this._clearTimers();
+          this._ws = null;
+        }
+        resolve();
+      };
 
       ws.on('open', async () => {
+        if (!isCurrent()) return;
         this.log('info', `Connected to ${this.wsUrl}`);
         this._startPing();
         this._saveState({ startedAt: this._state.startedAt ?? new Date().toISOString() });
 
         if (this.backfill && this._state.lastAlertAt) {
           try {
-            await this._fetchPastAlerts(this._state.lastAlertAt);
+            await this._fetchPastAlerts(this._state.lastAlertAt, {
+              signal: backfillController.signal,
+              shouldDispatch: isCurrent,
+            });
           } catch (err) {
-            this.log('warn', `Backfill failed: ${err.message}`);
+            if (isCurrent()) this.log('warn', `Backfill failed: ${err.message}`);
           }
         }
       });
 
       ws.on('message', (raw) => {
+        if (!isCurrent()) return;
         let msg;
         try {
           msg = JSON.parse(raw.toString());
@@ -227,15 +253,12 @@ export class AlertsDaemon extends EventEmitter {
       });
 
       ws.on('close', (code, reason) => {
-        if (this._ws === ws) {
-          this._clearTimers();
-          this._ws = null;
-        }
         this.log('info', `Connection closed (code=${code} reason=${reason?.toString() ?? ''})`);
-        resolve(); // let the loop decide whether to reconnect
+        settle();
       });
 
       ws.on('error', (err) => {
+        if (!isCurrent()) return;
         this.log('error', `WebSocket error: ${err.message}`);
         if (/Unexpected server response: (401|403)\b/.test(err.message)) {
           this._running = false;
@@ -244,13 +267,9 @@ export class AlertsDaemon extends EventEmitter {
           if (typeof ws.terminate === 'function') ws.terminate();
           else ws.close();
         } catch { /* the reconnect loop handles this failed connection */ }
-        if (this._ws === ws) {
-          this._clearTimers();
-          this._ws = null;
-        }
         // Some WebSocket implementations do not emit `close` after a failed
         // handshake. Always settle so the reconnect loop cannot hang forever.
-        resolve();
+        settle();
       });
     });
   }
@@ -366,7 +385,7 @@ export class AlertsDaemon extends EventEmitter {
 
   // ── Backfill ─────────────────────────────────────────────────────────────────
 
-  async _fetchPastAlerts(since) {
+  async _fetchPastAlerts(since, { signal, shouldDispatch = () => true } = {}) {
     this.log('info', `Backfilling since ${since}`);
     const url = new URL(this.restUrl);
     url.searchParams.set('since', since);
@@ -374,13 +393,17 @@ export class AlertsDaemon extends EventEmitter {
 
     const res = await this._fetch(url.toString(), {
       headers: { apikey: this.apiKey },
+      signal,
     });
+
+    if (!shouldDispatch()) return;
 
     if (!res.ok) {
       throw new Error(`past-alerts ${res.status} ${res.statusText}`);
     }
 
     const body = await res.json();
+    if (!shouldDispatch()) return;
     if (!Array.isArray(body?.alerts)) {
       throw new Error('past-alerts returned an invalid response');
     }
@@ -393,6 +416,7 @@ export class AlertsDaemon extends EventEmitter {
 
     this.log('info', `Replaying ${alerts.length} missed alert(s)`);
     for (const alert of alerts) {
+      if (!shouldDispatch()) return;
       const alertTime = Date.parse(alert?.firedAt);
       const sinceTime = Date.parse(since);
       if (Number.isFinite(alertTime) && Number.isFinite(sinceTime) && alertTime < sinceTime) {
