@@ -568,12 +568,17 @@ function claimIsStale(claim) {
   if (!claim || typeof claim.at !== 'number') return true;
   if (Date.now() - claim.at > QUOTE_CLAIM_TTL_MS) return true;
   // Same machine: a pid that no longer exists cannot still be executing.
-  if (claim.host === os.hostname() && Number.isInteger(claim.pid)) {
+  if (claim.host === os.hostname()) {
+    // A claim this host wrote always carries its pid, so a missing or
+    // unusable one means the file is damaged rather than live.
+    if (!Number.isInteger(claim.pid) || claim.pid <= 0) return true;
     try {
       process.kill(claim.pid, 0);
     } catch (err) {
-      if (err.code === 'ESRCH') return true; // gone
-      // EPERM means the pid exists under another user — treat as alive.
+      // ESRCH: gone. Anything else (a pid outside the platform's range, for
+      // instance) is not a live process either. EPERM is: the pid exists
+      // under another user.
+      if (err.code !== 'EPERM') return true;
     }
   }
   return false;
@@ -627,10 +632,19 @@ export function claimQuoteForExecution(quoteId) {
         { cause: err },
       );
     }
-    // Stale: take it over. Another racer may win between the unlink and the
-    // exclusive create, in which case this attempt fails and that is correct.
+    // Stale: take it over. Another process clearing the same stale claim may
+    // win the exclusive create in between — it is executing now, so report
+    // that rather than let a bare EEXIST reach the user mid-trade.
     try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
-    take();
+    try {
+      take();
+    } catch (raceErr) {
+      if (raceErr.code !== 'EEXIST') throw raceErr;
+      throw new Error(
+        `Quote "${quoteId}" was claimed by another process while this run was clearing a stale claim. Wait for that run to finish and check the explorer before retrying.`,
+        { cause: raceErr },
+      );
+    }
   }
 
   let released = false;

@@ -11,6 +11,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { spawnSync } from 'child_process';
 import {
   resolveChain,
   getWalletChainType,
@@ -355,14 +356,52 @@ describe('quote storage', () => {
       releaseB();
     });
 
+    // A pid that has already exited, rather than a magic number: the default
+    // pid_max on Linux is 2 ** 22, so a large constant can be a live process.
+    function deadPid() {
+      const { pid } = spawnSync(process.execPath, ['-e', '0']);
+      return pid;
+    }
+
     it('reclaims a quote whose claiming process is gone', () => {
       const quoteId = saveQuote(solanaQuoteResponse, 'solana');
       const lockPath = path.join(tempDir, '.nansen', 'quotes', `${quoteId}.lock`);
-      // A pid that cannot exist, written by this host.
-      fs.writeFileSync(lockPath, JSON.stringify({ pid: 2 ** 22, host: os.hostname(), at: Date.now() }));
+      fs.writeFileSync(lockPath, JSON.stringify({ pid: deadPid(), host: os.hostname(), at: Date.now() }));
       const release = claimQuoteForExecution(quoteId);
       expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid).toBe(process.pid);
       release();
+    });
+
+    it('reclaims a claim from this host with a damaged pid', () => {
+      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
+      const lockPath = path.join(tempDir, '.nansen', 'quotes', `${quoteId}.lock`);
+      fs.writeFileSync(lockPath, JSON.stringify({ pid: 'not-a-pid', host: os.hostname(), at: Date.now() }));
+      const release = claimQuoteForExecution(quoteId);
+      expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid).toBe(process.pid);
+      release();
+    });
+
+    it('reports a lost race for a stale claim instead of a bare EEXIST', () => {
+      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
+      const lockPath = path.join(tempDir, '.nansen', 'quotes', `${quoteId}.lock`);
+      fs.writeFileSync(lockPath, JSON.stringify({ pid: deadPid(), host: os.hostname(), at: Date.now() }));
+
+      // Stand in for the racer: it wins the exclusive create between this
+      // run's unlink and its own take().
+      const realUnlink = fs.unlinkSync;
+      const spy = vi.spyOn(fs, 'unlinkSync').mockImplementation((target) => {
+        realUnlink(target);
+        if (String(target) === lockPath) {
+          fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, host: os.hostname(), at: Date.now() }));
+        }
+      });
+      try {
+        expect(() => claimQuoteForExecution(quoteId))
+          .toThrow(/claimed by another process while this run was clearing a stale claim/);
+      } finally {
+        spy.mockRestore();
+        realUnlink(lockPath);
+      }
     });
 
     it('reclaims a claim older than the TTL from another host', () => {
@@ -391,7 +430,7 @@ describe('quote storage', () => {
       const live = saveQuote(solanaQuoteResponse, 'solana');
       const quotesDir = path.join(tempDir, '.nansen', 'quotes');
       fs.writeFileSync(path.join(quotesDir, `${stale}.lock`), JSON.stringify({
-        pid: 2 ** 22, host: os.hostname(), at: Date.now(),
+        pid: deadPid(), host: os.hostname(), at: Date.now(),
       }));
       const release = claimQuoteForExecution(live);
       cleanupQuotes();
