@@ -70,7 +70,8 @@ nansen alerts daemon start --action 'openclaw inject --message "Alert: {alertNam
 nansen alerts daemon start --action 'process-alert.sh' --action-env
 
 # Test with local mock server
-node src/daemon/mock-server.js &
+# --backfill-count seeds 0-1000 recent REST records (default: 0)
+node src/daemon/mock-server.js --backfill-count 5 &
 nansen alerts daemon run --ws-url ws://localhost:9876/v1/smart-alert/stream
 
 # Check status

@@ -261,7 +261,7 @@ export class AlertsDaemon extends EventEmitter {
       ws.on('error', (err) => {
         if (!isCurrent()) return;
         this.log('error', `WebSocket error: ${err.message}`);
-        if (/Unexpected server response: (401|403)\b/.test(err.message)) {
+        if (err?.statusCode === 401 || err?.statusCode === 403 || /Unexpected server response: (401|403)\b/.test(err.message)) {
           this._running = false;
         }
         try {
@@ -422,13 +422,18 @@ export class AlertsDaemon extends EventEmitter {
     this.log('info', `Replaying ${alerts.length} missed alert(s)`);
     for (const alert of alerts) {
       if (!shouldDispatch()) return;
-      const alertTime = Date.parse(alert?.firedAt);
-      const sinceTime = Date.parse(since);
-      if (Number.isFinite(alertTime) && Number.isFinite(sinceTime) && alertTime < sinceTime) {
-        this.log('debug', `Already-processed backfill alert ignored: ${alert.alertId ?? 'unknown'}`);
+      if (!alert || typeof alert !== 'object' || Array.isArray(alert)) {
+        this.log('warn', 'Invalid backfill alert ignored');
         continue;
       }
-      this._handleMessage(alert);
+      const normalizedAlert = { ...alert, type: 'alert' };
+      const alertTime = Date.parse(normalizedAlert.firedAt);
+      const sinceTime = Date.parse(since);
+      if (Number.isFinite(alertTime) && Number.isFinite(sinceTime) && alertTime < sinceTime) {
+        this.log('debug', `Already-processed backfill alert ignored: ${normalizedAlert.alertId ?? 'unknown'}`);
+        continue;
+      }
+      this._handleMessage(normalizedAlert);
     }
   }
 

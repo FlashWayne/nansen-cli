@@ -17,6 +17,7 @@ import os from 'os';
 import path from 'path';
 import { buildDaemonChildArgv, buildDaemonCommand, readLastNonEmptyLines, resolveRestUrl } from '../commands/daemon.js';
 import { AlertsDaemon, interpolateCommand } from '../daemon/alerts-daemon.js';
+import { buildMockBackfillAlerts, parseMockServerOptions } from '../daemon/mock-server-fixtures.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -219,6 +220,26 @@ describe('AlertsDaemon', () => {
 
     await expect(daemon._connect()).resolves.toBeUndefined();
     expect(daemon._ws).toBeNull();
+  });
+
+  it('stops reconnecting on a structured HTTP auth upgrade error', async () => {
+    class StructuredAuthErrorWS extends EventEmitter {
+      constructor() {
+        super();
+        this.terminate = vi.fn();
+        setImmediate(() => {
+          const error = new Error('upgrade rejected');
+          error.statusCode = 403;
+          this.emit('error', error);
+        });
+      }
+    }
+    const { daemon } = makeDaemon({ WebSocket: StructuredAuthErrorWS });
+    daemon._running = true;
+
+    await daemon._connect();
+
+    expect(daemon._running).toBe(false);
   });
 
   it('does not dispatch stale backfill after a rapid close and reconnect', async () => {
@@ -570,6 +591,33 @@ describe('AlertsDaemon', () => {
     expect(seen).toEqual(['newer']);
   });
 
+  it('normalizes REST alert records and ignores non-object backfill entries', async () => {
+    const { daemon } = makeDaemon();
+    const seen = [];
+    daemon.on('alert', (alert) => seen.push({ id: alert.alertId, type: alert.type }));
+    daemon._state.lastAlertAt = '2026-03-20T10:00:00Z';
+    daemon._fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        alerts: [
+          { alertId: 'missing-type', firedAt: '2026-03-20T10:00:01Z' },
+          { type: 'unexpected', alertId: 'wrong-type', firedAt: '2026-03-20T10:00:02Z' },
+          null,
+          'invalid',
+          [],
+        ],
+      }),
+    });
+
+    await daemon._fetchPastAlerts(daemon._state.lastAlertAt);
+
+    expect(seen).toEqual([
+      { id: 'missing-type', type: 'alert' },
+      { id: 'wrong-type', type: 'alert' },
+    ]);
+    expect(daemon._logFn).toHaveBeenCalledWith('warn', 'Invalid backfill alert ignored');
+  });
+
   it('persists a bounded deduplication window before dispatch', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-dedup-'));
     const stateFile = path.join(dir, 'state.json');
@@ -671,6 +719,28 @@ describe('AlertsDaemon', () => {
 });
 
 describe('daemon command', () => {
+  it('strictly parses mock-server backfill options and builds recent REST records', () => {
+    expect(parseMockServerOptions([])).toEqual({ port: 9876, intervalSec: 10, backfillCount: 0 });
+    expect(parseMockServerOptions([
+      '--port', '9988', '--interval', '0.5', '--backfill-count', '2',
+    ])).toEqual({ port: 9988, intervalSec: 0.5, backfillCount: 2 });
+    expect(() => parseMockServerOptions(['--backfill-count', '-1'])).toThrow('between 0 and 1000');
+    expect(() => parseMockServerOptions(['--backfill-count', '1.5'])).toThrow('between 0 and 1000');
+    expect(() => parseMockServerOptions(['--backfill-count'])).toThrow('requires a value');
+    expect(() => parseMockServerOptions(['--unknown', '1'])).toThrow('Unknown option');
+
+    const records = buildMockBackfillAlerts([
+      { type: 'alert', alertId: 'template', alertName: 'Template', firedAt: null, data: {} },
+    ], 2, Date.parse('2026-03-20T10:00:00Z'));
+    expect(records).toHaveLength(2);
+    expect(records.map((record) => record.alertId)).toEqual(['mock-backfill-1', 'mock-backfill-2']);
+    expect(records.every((record) => record.type === undefined)).toBe(true);
+    expect(records.map((record) => record.firedAt)).toEqual([
+      '2026-03-20T09:58:00.000Z',
+      '2026-03-20T09:59:00.000Z',
+    ]);
+  });
+
   it('reads the correct 50-line log tail without reading a large file in full', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-log-tail-'));
     const logFile = path.join(dir, 'daemon.log');

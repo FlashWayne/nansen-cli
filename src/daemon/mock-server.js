@@ -2,7 +2,7 @@
  * Nansen CLI - Mock WebSocket server for local daemon testing.
  *
  * Usage:
- *   node src/daemon/mock-server.js [--port 9876] [--interval 10]
+ *   node src/daemon/mock-server.js [--port 9876] [--interval 10] [--backfill-count 0]
  *
  * Fires a fake alert every --interval seconds. Useful for developing
  * and testing the daemon without a real Nansen WS backend.
@@ -10,16 +10,9 @@
 
 import { WebSocketServer } from 'ws';
 import http from 'http';
+import { buildMockBackfillAlerts, parseMockServerOptions } from './mock-server-fixtures.js';
 
-const port = Number(process.argv.find((a, i, arr) => arr[i - 1] === '--port') ?? '9876');
-const intervalSec = Number(process.argv.find((a, i, arr) => arr[i - 1] === '--interval') ?? '10');
-
-if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
-  throw new Error('--port must be an integer between 1 and 65535');
-}
-if (!Number.isFinite(intervalSec) || intervalSec <= 0) {
-  throw new Error('--interval must be a positive number of seconds');
-}
+const { port, intervalSec, backfillCount } = parseMockServerOptions(process.argv.slice(2));
 
 const MOCK_ALERTS = [
   {
@@ -51,14 +44,15 @@ const MOCK_ALERTS = [
     },
   },
 ];
+const backfillAlerts = buildMockBackfillAlerts(MOCK_ALERTS, backfillCount);
 
 const httpServer = http.createServer((req, res) => {
   if (req.url?.startsWith('/api/v1/smart-alert/past-alerts')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      alerts: [],
-      count: 0,
-      oldest: null,
+      alerts: backfillAlerts,
+      count: backfillAlerts.length,
+      oldest: backfillAlerts[0]?.firedAt ?? null,
     }));
     return;
   }
@@ -117,6 +111,7 @@ wss.on('connection', (ws, req) => {
 httpServer.listen(port, '127.0.0.1', () => {
   console.log(`[mock-server] Listening on ws://localhost:${port}/v1/smart-alert/stream`);
   console.log(`[mock-server] Firing alerts every ${intervalSec}s`);
+  console.log(`[mock-server] Backfill alerts: ${backfillCount}`);
   console.log(`[mock-server] REST: http://localhost:${port}/api/v1/smart-alert/past-alerts`);
 });
 
