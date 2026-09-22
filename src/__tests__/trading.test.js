@@ -827,6 +827,20 @@ describe('buildApprovalTransaction', () => {
       .toThrow('Unsupported chain');
   });
 
+  it('should refuse an approval whose gas price is anomalous', () => {
+    const wallet = generateEvmWallet();
+    // 10,000 gwei x the fixed 100k approval gas = 1 ETH for one approval.
+    expect(() => buildApprovalTransaction(
+      '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+      '0x57df6092665eb6058de53939612413ff4b09114e',
+      wallet.privateKey,
+      'base',
+      0,
+      '10000000000000',
+      1000000n,
+    )).toThrow(/safety cap.*Refusing to sign/s);
+  });
+
   // An approval used to default to 1,000,000 wei (0.001 gwei) when the quote
   // carried no gas price. That transaction never mines, and the swap queued
   // behind it can never be sent — the same failure signEvmTransaction refuses.

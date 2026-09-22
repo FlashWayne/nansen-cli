@@ -786,6 +786,7 @@ export function signEvmTransaction(txData, privateKeyHex, chain, nonce) {
   };
 
   if (txData.maxFeePerGas) {
+    assertEvmFeeWithinCap(txData.maxFeePerGas, common.gasLimit, 'swap');
     return signEip1559Transaction({
       ...common,
       maxFeePerGas: toHex(txData.maxFeePerGas),
@@ -799,6 +800,7 @@ export function signEvmTransaction(txData, privateKeyHex, chain, nonce) {
   // information at all is refused (see NO_QUOTE_FEE_MESSAGE).
   if (!txData.gasPrice) throw new Error(NO_QUOTE_FEE_MESSAGE);
 
+  assertEvmFeeWithinCap(txData.gasPrice, common.gasLimit, 'swap');
   return signLegacyTransaction({ ...common, gasPrice: toHex(txData.gasPrice) }, privateKeyHex);
 }
 
@@ -812,6 +814,38 @@ export function signEvmTransaction(txData, privateKeyHex, chain, nonce) {
 // refusal is uniform.
 const NO_QUOTE_FEE_MESSAGE =
   'Quote supplied no gas price (expected gasPrice or maxFeePerGas), so any signed transaction would be unmineable. Refusing to sign.';
+
+// A quote's fee fields are signed verbatim, so a compromised or buggy
+// aggregator response can make the wallet pay an arbitrary tip to the block
+// producer with no revert and no warning. The Solana signer already bounds
+// this (MAX_PRIORITY_FEE_LAMPORTS in trade-validation.js, 0.01 SOL for a
+// single trade); this is the EVM sibling, bounding the worst case a single
+// transaction can cost as maxFeePerGas x gasLimit. The cap is deliberately
+// far above a normal Base swap (tens of thousands of gwei-gas at a few gwei,
+// i.e. well under 0.001 ETH) so only an anomalous quote trips it.
+export const MAX_EVM_TX_FEE_WEI = 10_000_000_000_000_000n; // 0.01 ETH
+
+// Gas limit used for every approval/revoke transaction this file signs.
+const APPROVAL_GAS_LIMIT = 100000;
+
+/**
+ * Refuse a transaction whose worst-case gas cost exceeds MAX_EVM_TX_FEE_WEI.
+ *
+ * @param {string|number} maxFeePerGas - Fee cap per gas, wei (decimal or 0x-hex)
+ * @param {string|number|bigint} gasLimit - Gas limit for the transaction
+ * @param {string} label - What is being signed, for the error message
+ * @throws {Error} when maxFeePerGas * gasLimit is above the cap
+ */
+export function assertEvmFeeWithinCap(maxFeePerGas, gasLimit, label = 'transaction') {
+  const feePerGas = BigInt(toHex(maxFeePerGas));
+  const gas = BigInt(toHex(gasLimit));
+  const worstCase = feePerGas * gas;
+  if (worstCase > MAX_EVM_TX_FEE_WEI) {
+    throw new Error(
+      `Quote would pay up to ${worstCase} wei of gas for this ${label} (${feePerGas} wei per gas x ${gas} gas), above the ${MAX_EVM_TX_FEE_WEI} wei safety cap. Refusing to sign.`,
+    );
+  }
+}
 
 /**
  * Resolve the fee fields for an EIP-1559 (type 2) signer from a quote's
@@ -1658,6 +1692,7 @@ export function buildApprovalTransaction(tokenAddress, spenderAddress, privateKe
   // An approval broadcast at a placeholder fee never mines and blocks the swap
   // behind it, so require a real gas price the same way signEvmTransaction does.
   if (!gasPrice) throw new Error(NO_QUOTE_FEE_MESSAGE);
+  assertEvmFeeWithinCap(gasPrice, APPROVAL_GAS_LIMIT, 'approval');
 
   // Scope the approval to the swap's input amount so a malicious or buggy quote
   // can drain at most this one trade, never the wallet's full token balance.
@@ -1668,7 +1703,7 @@ export function buildApprovalTransaction(tokenAddress, spenderAddress, privateKe
   const tx = {
     nonce,
     gasPrice: toHex(gasPrice),
-    gasLimit: '0x186a0', // 100000
+    gasLimit: toHex(APPROVAL_GAS_LIMIT),
     to: tokenAddress,
     value: '0x0',
     data,
@@ -3340,6 +3375,7 @@ EXAMPLES:
                 } else {
                   const { maxFeePerGas: approvalMaxFee, maxPriorityFeePerGas: approvalPriorityFee } =
                     resolveQuoteEip1559Fees(currentQuote.transaction);
+                  assertEvmFeeWithinCap(approvalMaxFee, APPROVAL_GAS_LIMIT, 'approval');
 
                   if (shouldRevoke) {
                     log(`  ⚠ Existing allowance (${existingAllowance}) for ${quoteName} is excessive (>${OVERSIZED_ALLOWANCE_MULTIPLIER}x this trade) — revoking before re-approving`);
@@ -3351,7 +3387,7 @@ EXAMPLES:
                       value: '0x0',
                       chain_id: chainConfig.chainId,
                       nonce: toHex(revokeNonce),
-                      gas_limit: toHex(100000),
+                      gas_limit: toHex(APPROVAL_GAS_LIMIT),
                       max_fee_per_gas: toHex(approvalMaxFee),
                       max_priority_fee_per_gas: toHex(approvalPriorityFee),
                     });
@@ -3404,7 +3440,7 @@ EXAMPLES:
                     value: '0x0',
                     chain_id: chainConfig.chainId,
                     nonce: toHex(approvalNonce),
-                    gas_limit: toHex(100000),
+                    gas_limit: toHex(APPROVAL_GAS_LIMIT),
                     max_fee_per_gas: toHex(approvalMaxFee),
                     max_priority_fee_per_gas: toHex(approvalPriorityFee),
                   });
@@ -3490,6 +3526,8 @@ EXAMPLES:
 
               // Privy signs EIP-1559 (type 2) transactions, so convert gasPrice to EIP-1559 fields
               const { maxFeePerGas: maxFee, maxPriorityFeePerGas: priorityFee } = resolveQuoteEip1559Fees(txData);
+
+              assertEvmFeeWithinCap(maxFee, finalGas, 'swap');
 
               log('  Signing EVM transaction via Privy...');
               const signResult = await privyClient.signEvmTransaction(evmWalletId, {

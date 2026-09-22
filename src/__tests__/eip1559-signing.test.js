@@ -7,6 +7,8 @@ import {
   signEip1559Transaction,
   resolveQuoteEip1559Fees,
   resolveQuoteLegacyGasPrice,
+  assertEvmFeeWithinCap,
+  MAX_EVM_TX_FEE_WEI,
 } from '../trading.js';
 
 // Valid secp256k1 scalar, matching the convention in perp.test.js. Deliberately
@@ -190,5 +192,46 @@ describe('resolveQuoteLegacyGasPrice', () => {
   it('refuses a quote with no fee information', () => {
     expect(() => resolveQuoteLegacyGasPrice({})).toThrow(/no gas price.*Refusing to sign/s);
     expect(() => resolveQuoteLegacyGasPrice(undefined)).toThrow(/Refusing to sign/);
+  });
+});
+
+// The fee fields of a quote are signed verbatim, so a compromised or buggy
+// aggregator response could make the wallet pay an arbitrary tip to the block
+// producer. The Solana signer already caps the priority fee a single trade can
+// pay (MAX_PRIORITY_FEE_LAMPORTS); this is the EVM sibling.
+describe('assertEvmFeeWithinCap', () => {
+  it('accepts a normal Base swap fee', () => {
+    // 5 gwei x 300k gas = 0.0015 ETH
+    expect(() => assertEvmFeeWithinCap('5000000000', 300000, 'swap')).not.toThrow();
+    expect(() => assertEvmFeeWithinCap('0x12a05f200', '0x493e0', 'swap')).not.toThrow();
+  });
+
+  it('accepts a fee exactly at the cap', () => {
+    expect(() => assertEvmFeeWithinCap(MAX_EVM_TX_FEE_WEI / 300000n, 300000, 'swap')).not.toThrow();
+  });
+
+  it('refuses a fee above the cap and names the numbers', () => {
+    // 10,000 gwei x 300k gas = 3 ETH
+    expect(() => assertEvmFeeWithinCap('10000000000000', 300000, 'swap'))
+      .toThrow(/3000000000000000000 wei of gas for this swap.*safety cap.*Refusing to sign/s);
+  });
+});
+
+describe('signEvmTransaction fee ceiling', () => {
+  const base = { to: '0x' + '11'.repeat(20), data: '0x', value: '0', gas: '300000' };
+
+  it('refuses an EIP-1559 quote whose fee cap is anomalous', () => {
+    expect(() => signEvmTransaction({ ...base, maxFeePerGas: '10000000000000' }, KEY, 'base', 1))
+      .toThrow(/safety cap/);
+  });
+
+  it('refuses a legacy quote whose gas price is anomalous', () => {
+    expect(() => signEvmTransaction({ ...base, gasPrice: '10000000000000' }, KEY, 'base', 1))
+      .toThrow(/safety cap/);
+  });
+
+  it('still signs a normal quote', () => {
+    expect(signEvmTransaction({ ...base, maxFeePerGas: '5000000000' }, KEY, 'base', 1)).toMatch(/^0x02/);
+    expect(signEvmTransaction({ ...base, gasPrice: '5000000000' }, KEY, 'base', 1)).toMatch(/^0x/);
   });
 });
