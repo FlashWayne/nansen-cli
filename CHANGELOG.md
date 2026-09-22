@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.47.0
+
+### Minor Changes
+
+- [#668](https://github.com/nansen-ai/nansen-cli/pull/668) [`77b7020`](https://github.com/nansen-ai/nansen-cli/commit/77b7020af913f777dcf45fea82af19a47d3221f3) Thanks [@gulshngill](https://github.com/gulshngill)! - Add `--debug` request tracing. `--debug` (or `NANSEN_DEBUG=1`) prints HTTP trace events to stderr — method, URL, response status, time-to-response-headers in milliseconds (TTFB; excluding body download/parsing), retry decisions (attempt, reason, delay) and the server request id — so auth, timing, retry and response-shape problems can be diagnosed without guesswork. stdout still carries only the JSON/CSV, so piping is unaffected. The trace never prints credentials or response bodies: header values are withheld entirely, and query-string values are blanked whenever the parameter names a key, token, secret, signature, password or auth, as is any remaining credential-shaped value.
+
+  Migration: `DEBUG=1` no longer enables Nansen diagnostics. Use `NANSEN_DEBUG=1` (or `--debug`) instead.
+
+- [#656](https://github.com/nansen-ai/nansen-cli/pull/656) [`7faeb1c`](https://github.com/nansen-ai/nansen-cli/commit/7faeb1c40bf2524fa04f81cdfe80f895a60c93db) Thanks [@gulshngill](https://github.com/gulshngill)! - Add `--paginate` (alias `--all`) to fetch every page of a list-returning command in one call (API-275). Starts at `--page`, uses `--limit` as the page size, and stops on a short or empty page, on server completion metadata, on a repeated page, or after `--max-pages` requests (default 10, maximum 1000). `--max-pages` is parsed only when pagination is active and is otherwise ignored. The merged response keeps the first page's shape with rows de-duplicated and adds `pagination: { page, pages_fetched, next_page, complete }`; `next_page` tells you where to resume when the cap was hit, and the stderr credit summary totals live page requests. Default single-page behaviour is unchanged.
+
+  Table, CSV, and stream output now intentionally use the same row extraction as pagination: they render rows inside nested `{ data: { data: [...] } }` and `{ data: { results: [...] } }` envelopes, and inside an unambiguous descriptive top-level array key such as `trades` or `holdings`, individually instead of treating the envelope as one row. Envelopes with multiple top-level arrays are not guessed.
+
+  This remains a minor release because the default JSON contract is unchanged; only the opt-in table, CSV, and NDJSON handling of a previously inconsistent, undocumented envelope shape is normalized.
+
+  With `token screener --search --paginate`, `--limit` remains the server page size and each candidate page is separately billed up to `--max-pages`; the merged candidate set is then filtered client-side without slicing it back to one page.
+
+### Patch Changes
+
+- [#685](https://github.com/nansen-ai/nansen-cli/pull/685) [`ca758cc`](https://github.com/nansen-ai/nansen-cli/commit/ca758ccb53c865a33007e3643d98c7aa67de99ba) Thanks [@kriss39](https://github.com/kriss39)! - `perp order` take-profit/stop-loss side validation and `perp transfer` amount bounds now throw coded `INVALID_INPUT` errors like the rest of the perp input guards
+
+- [#684](https://github.com/nansen-ai/nansen-cli/pull/684) [`5485795`](https://github.com/nansen-ai/nansen-cli/commit/5485795c39105d17afb19ec4f9d682aff88c8ce0) Thanks [@kriss39](https://github.com/kriss39)! - `research profiler trace` clamps `--width` to 1-50 (as `--depth` is clamped to 1-5) and stops expanding the counterparty graph after 1000 nodes, reporting `stats.truncated`, so a hub address can no longer turn one command into hundreds of API calls
+
 ## 1.46.0
 
 ### Minor Changes
