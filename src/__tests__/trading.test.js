@@ -16,6 +16,7 @@ import {
   getWalletChainType,
   saveQuote,
   loadQuote,
+  claimQuoteForExecution,
   cleanupQuotes,
   readCompactU16,
   toBuffer,
@@ -318,6 +319,86 @@ describe('quote storage', () => {
     const loaded = loadQuote(quoteId);
     expect(loaded.chain).toBe('base');
     expect(loaded.toChain).toBeUndefined();
+  });
+
+  // loadQuote's executedAt check only rejects a quote that has already been
+  // broadcast, and markQuoteExecuted writes that marker after the broadcast.
+  // Two concurrent `trade execute --quote <id>` runs (an agent retrying a
+  // call it believes timed out) therefore both passed the check and could
+  // each sign and broadcast; on Solana no shared nonce stops the second one.
+  describe('execution claim', () => {
+    it('refuses a second claim while the first is held', () => {
+      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
+      const release = claimQuoteForExecution(quoteId);
+      try {
+        expect(() => claimQuoteForExecution(quoteId))
+          .toThrow(/already being executed.*check the explorer before retrying/s);
+      } finally {
+        release();
+      }
+    });
+
+    it('lets the quote be claimed again after the first run releases', () => {
+      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
+      claimQuoteForExecution(quoteId)();
+      const again = claimQuoteForExecution(quoteId);
+      expect(typeof again).toBe('function');
+      again();
+    });
+
+    it('does not block a different quote', () => {
+      const a = saveQuote(solanaQuoteResponse, 'solana');
+      const b = saveQuote(solanaQuoteResponse, 'solana');
+      const releaseA = claimQuoteForExecution(a);
+      const releaseB = claimQuoteForExecution(b);
+      releaseA();
+      releaseB();
+    });
+
+    it('reclaims a quote whose claiming process is gone', () => {
+      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
+      const lockPath = path.join(tempDir, '.nansen', 'quotes', `${quoteId}.lock`);
+      // A pid that cannot exist, written by this host.
+      fs.writeFileSync(lockPath, JSON.stringify({ pid: 2 ** 22, host: os.hostname(), at: Date.now() }));
+      const release = claimQuoteForExecution(quoteId);
+      expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid).toBe(process.pid);
+      release();
+    });
+
+    it('reclaims a claim older than the TTL from another host', () => {
+      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
+      const lockPath = path.join(tempDir, '.nansen', 'quotes', `${quoteId}.lock`);
+      fs.writeFileSync(lockPath, JSON.stringify({
+        pid: process.pid, host: 'some-other-host', at: Date.now() - 16 * 60 * 1000,
+      }));
+      const release = claimQuoteForExecution(quoteId);
+      expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).host).toBe(os.hostname());
+      release();
+    });
+
+    it('keeps a live claim from another host that is within the TTL', () => {
+      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
+      const lockPath = path.join(tempDir, '.nansen', 'quotes', `${quoteId}.lock`);
+      fs.writeFileSync(lockPath, JSON.stringify({
+        pid: process.pid, host: 'some-other-host', at: Date.now() - 60 * 1000,
+      }));
+      expect(() => claimQuoteForExecution(quoteId)).toThrow(/already being executed/);
+      fs.unlinkSync(lockPath);
+    });
+
+    it('cleanupQuotes removes a stale claim but keeps a live one', () => {
+      const stale = saveQuote(solanaQuoteResponse, 'solana');
+      const live = saveQuote(solanaQuoteResponse, 'solana');
+      const quotesDir = path.join(tempDir, '.nansen', 'quotes');
+      fs.writeFileSync(path.join(quotesDir, `${stale}.lock`), JSON.stringify({
+        pid: 2 ** 22, host: os.hostname(), at: Date.now(),
+      }));
+      const release = claimQuoteForExecution(live);
+      cleanupQuotes();
+      expect(fs.existsSync(path.join(quotesDir, `${stale}.lock`))).toBe(false);
+      expect(fs.existsSync(path.join(quotesDir, `${live}.lock`))).toBe(true);
+      release();
+    });
   });
 
   it('tags saved quotes as swap and loads them', () => {

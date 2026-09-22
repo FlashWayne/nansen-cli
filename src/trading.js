@@ -8,6 +8,7 @@
 import { rejectBlankOption } from './query-options.js';
 import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { base58Encode, exportWallet, getWalletConfig, showWallet, listWallets } from './wallet.js';
 import { base58Decode, encodeCompactU16 } from './transfer.js';
@@ -557,6 +558,89 @@ export function markQuoteExecuted(quoteId, progress = {}) {
   }
 }
 
+// How long a claim is honoured when the claiming process cannot be seen (a
+// different machine sharing the config dir, or a pid that has been recycled).
+// Generously above a full execute: approval broadcast plus up to a 180s
+// receipt wait, the swap broadcast and its own confirmation wait.
+const QUOTE_CLAIM_TTL_MS = 15 * 60 * 1000;
+
+function claimIsStale(claim) {
+  if (!claim || typeof claim.at !== 'number') return true;
+  if (Date.now() - claim.at > QUOTE_CLAIM_TTL_MS) return true;
+  // Same machine: a pid that no longer exists cannot still be executing.
+  if (claim.host === os.hostname() && Number.isInteger(claim.pid)) {
+    try {
+      process.kill(claim.pid, 0);
+    } catch (err) {
+      if (err.code === 'ESRCH') return true; // gone
+      // EPERM means the pid exists under another user — treat as alive.
+    }
+  }
+  return false;
+}
+
+/**
+ * Claim a quote for execution, so two concurrent `trade execute --quote <id>`
+ * runs cannot both sign and broadcast it.
+ *
+ * loadQuote's `executedAt` check only rejects a quote that has already been
+ * broadcast, and `markQuoteExecuted` writes that marker after the broadcast.
+ * Everything in between — sanctions screening, preflight, an approval with up
+ * to a 180s receipt wait — is a window in which a second invocation passes the
+ * same check. An agent retrying a tool call it believes timed out therefore
+ * gets two independently valid swaps; on Solana there is no shared nonce to
+ * make the second one fail.
+ *
+ * The claim is an exclusive-create sidecar file, so the check and the take are
+ * one filesystem operation. Returns a release function for the caller's
+ * `finally`; the claim also expires (see QUOTE_CLAIM_TTL_MS) and is reclaimed
+ * if the claiming process is gone, so a crash cannot strand the quote.
+ *
+ * @param {string} quoteId
+ * @returns {() => void} release
+ */
+export function claimQuoteForExecution(quoteId) {
+  const lockPath = safeQuotesPath(`${quoteId}.lock`);
+  if (!lockPath) throw new Error(`Invalid quote id "${quoteId}".`);
+  const claim = { pid: process.pid, host: os.hostname(), at: Date.now() };
+
+  const take = () => {
+    const fd = fs.openSync(lockPath, 'wx', 0o600);
+    try {
+      fs.writeFileSync(fd, JSON.stringify(claim));
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+
+  try {
+    take();
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err;
+    let existing = null;
+    try {
+      existing = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    } catch { /* unreadable or truncated claim — treat as stale */ }
+    if (!claimIsStale(existing)) {
+      throw new Error(
+        `Quote "${quoteId}" is already being executed (started ${new Date(existing.at).toISOString()} by pid ${existing.pid}). Wait for that run to finish and check the explorer before retrying.`,
+        { cause: err },
+      );
+    }
+    // Stale: take it over. Another racer may win between the unlink and the
+    // exclusive create, in which case this attempt fails and that is correct.
+    try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
+    take();
+  }
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
+  };
+}
+
 /**
  * Remove stale files from the quotes dir. Quote files use a 1-hour TTL because
  * the price is stale; tx records use a 30-day TTL because a finalized tx hash
@@ -567,6 +651,14 @@ export function cleanupQuotes() {
   if (!fs.existsSync(dir)) return;
   const now = Date.now();
   for (const file of fs.readdirSync(dir)) {
+    if (file.endsWith('.lock')) {
+      // An execution claim outlives its process only after a crash.
+      try {
+        const claim = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
+        if (claimIsStale(claim)) fs.unlinkSync(path.join(dir, file));
+      } catch { try { fs.unlinkSync(path.join(dir, file)); } catch { /* ignore */ } }
+      continue;
+    }
     if (!file.endsWith('.json')) continue;
     const ttl = file.startsWith('tx-') ? TX_RECORD_TTL_MS : 3600000;
     try {
@@ -2910,6 +3002,7 @@ EXAMPLES:
   nansen trade execute --quote 1708900000000-abc123 --yes`, 'MISSING_ARGS');
       }
 
+      let releaseQuoteClaim = null;
       try {
         const quoteData = loadQuote(quoteId);
         const chain = quoteData.chain;
@@ -3057,6 +3150,11 @@ EXAMPLES:
           confirmationLog,
         });
         if (!proceed) return undefined;
+
+        // Past this point the run signs and broadcasts. Claim the quote so a
+        // second concurrent execute cannot pass loadQuote's already-executed
+        // check during the window before the first broadcast is recorded.
+        releaseQuoteClaim = claimQuoteForExecution(quoteId);
 
         // Determine if this is a WalletConnect or Privy-signed quote
         const isWalletConnect = quoteData.signerType === 'walletconnect'
@@ -4422,6 +4520,11 @@ EXAMPLES:
         let msg = `Error: ${err.message}`;
         if (err.details) msg += `\n  Details: ${JSON.stringify(err.details)}`;
         throw new CommandError(msg, err.code || 'EXECUTE_ERROR');
+      } finally {
+        // markQuoteExecuted has already consumed the quote on every path that
+        // broadcast, so releasing here only frees a quote no broadcast was
+        // made for.
+        if (releaseQuoteClaim) releaseQuoteClaim();
       }
     },
 
