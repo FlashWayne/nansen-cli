@@ -297,7 +297,10 @@ export function buildDaemonCommand(deps = {}) {
       return;
     }
 
-    for (const key of ['action', 'ws-url', 'rest-url', 'state-file', 'pid-file', 'log-file', 'daemon-mode']) {
+    const usesAlertEndpoints = sub === 'run' || sub === 'start';
+    const stringOptions = ['action', 'state-file', 'pid-file', 'log-file', 'daemon-mode'];
+    if (usesAlertEndpoints) stringOptions.push('ws-url', 'rest-url');
+    for (const key of stringOptions) {
       if (options[key] !== undefined && (typeof options[key] !== 'string' || !options[key])) {
         throw new Error(`--${key} must be a non-empty string`);
       }
@@ -306,13 +309,13 @@ export function buildDaemonCommand(deps = {}) {
       throw new Error('--daemon-mode must be background');
     }
 
-    if (options['ws-url']) {
+    if (usesAlertEndpoints && options['ws-url']) {
       validateServiceUrl(options['ws-url'], 'ws-url', 'wss:', 'ws:');
     }
-    if (options['rest-url']) {
+    if (usesAlertEndpoints && options['rest-url']) {
       validateServiceUrl(options['rest-url'], 'rest-url', 'https:', 'http:');
     }
-    const restUrl = sub === 'run' || sub === 'start'
+    const restUrl = usesAlertEndpoints
       ? resolveRestUrl(options['ws-url'], options['rest-url'], !flags['no-backfill'])
       : undefined;
 

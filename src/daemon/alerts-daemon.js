@@ -362,11 +362,16 @@ export class AlertsDaemon extends EventEmitter {
       });
 
       if (!this.actionEnv) {
-        child.stdin.on('error', (err) => {
-          this.log('error', `Action hook stdin error: ${err.message}`);
-        });
-        child.stdin.write(alertJson);
-        child.stdin.end();
+        const stdin = child?.stdin;
+        if (!stdin || typeof stdin.on !== 'function' || typeof stdin.write !== 'function' || typeof stdin.end !== 'function') {
+          this.log('warn', `Action hook stdin unavailable for alert ${alert.alertId ?? 'unknown'}`);
+        } else {
+          stdin.on('error', (err) => {
+            this.log('error', `Action hook stdin error: ${err.message}`);
+          });
+          stdin.write(alertJson);
+          stdin.end();
+        }
       }
 
       child.on('error', (err) => {

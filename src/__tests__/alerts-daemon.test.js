@@ -304,6 +304,25 @@ describe('AlertsDaemon', () => {
     expect(close).toHaveBeenCalledWith(0);
   });
 
+  it('warns when piped action stdin is unavailable and still handles spawn errors', () => {
+    const child = new EventEmitter();
+    child.stdin = null;
+    const { daemon } = makeDaemon({
+      action: 'handler',
+      actionEnv: false,
+      spawnFn: vi.fn(() => child),
+    });
+
+    expect(() => daemon._dispatchAlert(makeAlert({ alertId: 'stdin-missing' }))).not.toThrow();
+    expect(daemon._logFn).toHaveBeenCalledWith(
+      'warn',
+      'Action hook stdin unavailable for alert stdin-missing',
+    );
+
+    child.emit('error', new Error('spawn failed later'));
+    expect(daemon._logFn).toHaveBeenCalledWith('error', 'Action hook error: spawn failed later');
+  });
+
   it('emits "alert" event and writes JSON to stdout', async () => {
     const alert = makeAlert();
 
@@ -1055,8 +1074,33 @@ describe('daemon command', () => {
         'pid-file': -1,
       })).rejects.toThrow('--pid-file must be a non-empty string');
       await expect(command(['status'], null, {}, {
+        'pid-file': pidFile,
         'ws-url': 'ws://example.com/stream',
-      })).rejects.toThrow('--ws-url must use wss://');
+        'rest-url': 42,
+      })).resolves.toMatchObject({ running: false });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores endpoint options for stop and logs but validates them for run and start', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-daemon-irrelevant-url-'));
+    const pidFile = path.join(dir, 'daemon.pid');
+    const logFile = path.join(dir, 'missing.log');
+    const log = vi.fn();
+    const command = buildDaemonCommand({ log, getApiKey: () => 'test-key' });
+    const irrelevant = {
+      'pid-file': pidFile,
+      'log-file': logFile,
+      'ws-url': { invalid: true },
+      'rest-url': '',
+    };
+
+    try {
+      await expect(command(['stop'], null, {}, irrelevant)).resolves.toBeUndefined();
+      await expect(command(['logs'], null, {}, irrelevant)).resolves.toBeUndefined();
+      await expect(command(['run'], null, {}, irrelevant)).rejects.toThrow('--ws-url must be a non-empty string');
+      await expect(command(['start'], null, {}, irrelevant)).rejects.toThrow('--ws-url must be a non-empty string');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
