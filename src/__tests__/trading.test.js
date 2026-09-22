@@ -3340,6 +3340,47 @@ describe('quote command with --amount-unit usd', () => {
     delete process.env.NANSEN_WALLET_PASSWORD;
   });
 
+  // validateQuoteInput checks the raw dollar figure (positive), then the usd
+  // branch pre-rounds with toFixed(decimals) before convertToBaseUnits sees
+  // the value — so its "meaningful digits lost" guard never fires and a tiny
+  // but positive --amount silently became amount=0 in the quote request.
+  it('should refuse a USD amount that rounds to zero base units', async () => {
+    createWallet('default', 'testpass');
+    process.env.NANSEN_WALLET_PASSWORD = 'testpass';
+
+    const origFetch = global.fetch;
+    const fetchCalls = [];
+    global.fetch = vi.fn(async (url, opts) => {
+      fetchCalls.push({ url: url.toString(), opts });
+      return { ok: true, text: async () => JSON.stringify({ success: true, quotes: [] }) };
+    });
+
+    const mockApiInstance = {
+      request: screenApi.request,
+      generalSearch: vi.fn().mockResolvedValue({
+        tokens: [{ address: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', chain: 'solana', price: 1 }],
+      }),
+    };
+
+    const cmds = buildTradingCommands({ log: vi.fn(), exit: vi.fn() });
+    await expect(cmds.quote([], mockApiInstance, {}, {
+      chain: 'solana',
+      from: 'USDC',
+      to: 'SOL',
+      amount: '0.0000001',
+      'amount-unit': 'usd',
+    })).rejects.toMatchObject({
+      code: 'INVALID_INPUT',
+      message: expect.stringMatching(/resolves to 0 base units.*swap of nothing/s),
+    });
+
+    // No quote request may be sent for a zero amount.
+    expect(fetchCalls.find(c => c.url.includes('quote'))).toBeUndefined();
+
+    global.fetch = origFetch;
+    delete process.env.NANSEN_WALLET_PASSWORD;
+  });
+
   it('should price the --to token in exactOut mode', async () => {
     createWallet('default', 'testpass');
     process.env.NANSEN_WALLET_PASSWORD = 'testpass';

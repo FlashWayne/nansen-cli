@@ -2692,6 +2692,21 @@ CROSS-CHAIN NOTES (when using --to-chain):
         const fromWarning = getWrappedNativeFromWarning(from, chain);
         if (fromWarning) log(`  ${fromWarning}`);
 
+        // Every unit conversion above can land on zero base units without
+        // tripping a guard of its own: validateQuoteInput checked the raw
+        // --amount (a positive dollar or percent figure), and the usd and
+        // percent branches pre-round with toFixed() before convertToBaseUnits
+        // sees the value, so its "meaningful digits lost" check never fires.
+        // A zero would be sent to the quote endpoint as a real request.
+        if (!/^\d+$/.test(String(resolvedAmount)) || BigInt(resolvedAmount) === 0n) {
+          const unitSuffix = amountUnit ? ` --amount-unit ${amountUnit}` : '';
+          const scale = resolvedDecimals !== undefined ? ` at ${resolvedDecimals} decimals` : '';
+          throw new CommandError(
+            `Error: --amount ${amount}${unitSuffix} resolves to ${resolvedAmount} base units${scale}, which would quote a swap of nothing. Use a larger amount.`,
+            'INVALID_INPUT',
+          );
+        }
+
         const params = {
           chainIndex: chainConfig.index,
           fromTokenAddress: from,
