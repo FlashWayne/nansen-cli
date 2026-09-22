@@ -294,7 +294,7 @@ describe('createPaymentSignatures — policy guard integration', () => {
     vi.doUnmock('../x402-svm.js');
   });
 
-  it('12c. keeps the server order for options that cost the same', async () => {
+  it('12b. keeps the server order for options that cost the same', async () => {
     const first = { ...makeRequirement(10000n), extra: { name: 'USD Coin', version: '2', tag: 'first' } };
     const second = { ...makeRequirement(10000n), extra: { name: 'USD Coin', version: '2', tag: 'second' } };
 
