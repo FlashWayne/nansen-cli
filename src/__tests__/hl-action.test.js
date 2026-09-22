@@ -112,6 +112,32 @@ describe('floatToWire', () => {
   it('throws when a value cannot be represented in 8 decimals', () => {
     expect(() => floatToWire(0.123456789)).toThrow(/rounding/);
   });
+
+  // toFixed() renders 1e21 and above in exponential notation ("1e+21"), which
+  // HL's parser rejects. The precision guard passes it through
+  // (parseFloat("1e+21") === 1e21) and the trailing-zero strip is skipped for
+  // a string with no ".", so the malformed value used to reach the signed
+  // action and fail opaquely after signing.
+  it('refuses a value that would render in exponential notation', () => {
+    for (const v of [1e21, 5e25, -1e21]) {
+      expect(() => floatToWire(v)).toThrow(expect.objectContaining({
+        name: 'CommandError',
+        code: 'INVALID_INPUT',
+      }));
+      expect(() => floatToWire(v)).toThrow(/below 1e21/);
+    }
+  });
+
+  it('refuses a non-finite value', () => {
+    for (const v of [Infinity, -Infinity, NaN]) {
+      expect(() => floatToWire(v)).toThrow(/finite number below 1e21/);
+    }
+  });
+
+  it('still renders the largest plain-decimal values', () => {
+    expect(floatToWire(9.99e20)).toBe('999000000000000000000');
+    expect(floatToWire(-0)).toBe('0');
+  });
 });
 
 describe('pyRound (bankers rounding)', () => {
@@ -175,6 +201,33 @@ describe('zero-rounded order values', () => {
 // perp.js documents that every input guard throws a coded CommandError so an
 // agent can branch on `code`; the TP/SL side checks were the one set that
 // still threw a bare Error with code undefined.
+// --price / --size accept a plain digit string, so a 22-digit value reaches
+// the builders as 1e21 without any exponent syntax in the CLI argument.
+describe('order values that cannot be rendered as decimals', () => {
+  it('refuses an order price at or above 1e21', () => {
+    expect(() => buildOrderAction(
+      { isBuy: true, orderType: 'limit', size: 0.01, price: 1e21 }, ETH,
+    )).toThrow(expect.objectContaining({ name: 'CommandError', code: 'INVALID_INPUT' }));
+  });
+
+  it('refuses an order size at or above 1e21', () => {
+    expect(() => buildOrderAction(
+      { isBuy: true, orderType: 'limit', size: 1e21, price: 2000 }, ETH,
+    )).toThrow(/below 1e21/);
+  });
+
+  it('refuses a close size at or above 1e21', () => {
+    expect(() => buildCloseAction({ isBuy: false, size: 1e21, price: 2000 }, ETH))
+      .toThrow(/below 1e21/);
+  });
+
+  it('refuses a trigger price at or above 1e21', () => {
+    expect(() => buildOrderAction(
+      { isBuy: true, orderType: 'limit', size: 0.01, price: 2000, takeProfit: 1e21 }, ETH,
+    )).toThrow(/below 1e21/);
+  });
+});
+
 describe('take-profit / stop-loss side validation', () => {
   const long = params => buildOrderAction({ isBuy: true, orderType: 'limit', size: 0.01, price: 2000, ...params }, ETH);
   const short = params => buildOrderAction({ isBuy: false, orderType: 'limit', size: 0.01, price: 2000, ...params }, ETH);

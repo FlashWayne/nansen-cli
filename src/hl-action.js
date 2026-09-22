@@ -171,6 +171,19 @@ export function encodeMsgpack(v) {
 // canonical decimal string HL expects in order wires (e.g. 1924.7 -> "1924.7",
 // 0.006 -> "0.006", 2000 -> "2000"). No scientific notation.
 export function floatToWire(x) {
+  // toFixed() switches to exponential notation from 1e21 up ("1e+21"), which
+  // is not a decimal string HL's parser accepts. The precision check below
+  // does not catch it (parseFloat("1e+21") === 1e21) and the trailing-zero
+  // strip is skipped for a string with no ".", so the malformed value would
+  // reach the signed action and be rejected opaquely after signing.
+  // buildUsdClassTransferAction refuses the same boundary for transfer
+  // amounts; order price/size and trigger prices go through here.
+  if (!Number.isFinite(x) || Math.abs(x) >= 1e21) {
+    throw new CommandError(
+      `Invalid order value: ${x}. Must be a finite number below 1e21.`,
+      'INVALID_INPUT',
+    );
+  }
   const rounded = x.toFixed(8);
   if (Math.abs(parseFloat(rounded) - x) >= 1e-12) {
     throw new Error(`floatToWire causes rounding: ${x}`);
