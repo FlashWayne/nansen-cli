@@ -210,21 +210,42 @@ describe('order values that cannot be rendered as decimals', () => {
     )).toThrow(expect.objectContaining({ name: 'CommandError', code: 'INVALID_INPUT' }));
   });
 
+  // The message names the offending field so the user knows which flag to fix.
+  it('refuses an order price at or above 1e21 and names the field', () => {
+    expect(() => buildOrderAction(
+      { isBuy: true, orderType: 'limit', size: 0.01, price: 1e21 }, ETH,
+    )).toThrow(/Invalid order price: .*below 1e21/);
+  });
+
   it('refuses an order size at or above 1e21', () => {
     expect(() => buildOrderAction(
       { isBuy: true, orderType: 'limit', size: 1e21, price: 2000 }, ETH,
-    )).toThrow(/below 1e21/);
+    )).toThrow(/Invalid order size: .*below 1e21/);
   });
 
   it('refuses a close size at or above 1e21', () => {
     expect(() => buildCloseAction({ isBuy: false, size: 1e21, price: 2000 }, ETH))
-      .toThrow(/below 1e21/);
+      .toThrow(/Invalid order size: .*below 1e21/);
   });
 
-  it('refuses a trigger price at or above 1e21', () => {
+  it('refuses a take-profit trigger price at or above 1e21', () => {
     expect(() => buildOrderAction(
       { isBuy: true, orderType: 'limit', size: 0.01, price: 2000, takeProfit: 1e21 }, ETH,
-    )).toThrow(/below 1e21/);
+    )).toThrow(/Invalid take-profit price: .*below 1e21/);
+  });
+
+  it('refuses a stop-loss trigger price at or above 1e21', () => {
+    expect(() => buildOrderAction(
+      { isBuy: false, orderType: 'limit', size: 0.01, price: 2000, stopLoss: 1e21 }, ETH,
+    )).toThrow(/Invalid stop-loss price: .*below 1e21/);
+  });
+
+  // A price the user typed below the boundary can still be rounded onto it:
+  // roundPrice does 5-significant-figure rounding first.
+  it('refuses a price that rounding lifts onto the boundary', () => {
+    expect(() => buildOrderAction(
+      { isBuy: true, orderType: 'limit', size: 0.01, price: 9.99999e20 }, ETH,
+    )).toThrow(/Invalid order price: .*below 1e21/);
   });
 });
 
