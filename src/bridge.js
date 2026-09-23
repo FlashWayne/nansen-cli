@@ -17,6 +17,7 @@ import {
   evmRpcCall,
   getEvmNonce,
   getQuotesDir,
+  parseMaxTxFeeOption,
   resolveUsdPrice,
   safeQuotesPath,
   signEvmTransaction,
@@ -1229,6 +1230,7 @@ async function processEvmStep(step, { chain, privateKeyHex, signerAddress, log, 
       privateKeyHex,
       chain,
       nonce,
+      { label: `bridge step "${step.id}"`, maxTxFeeWei: feeOverrides?.maxTxFeeWei },
     );
 
     log(`  Broadcasting ${step.id} on ${chain}...`);
@@ -1819,6 +1821,8 @@ RECOVERY OPTIONS (EVM deposit legs only):
   --priority-fee  Priority fee in gwei, overriding the quoted one
   --max-fee       Fee cap in gwei, overriding the computed one
   --nonce         Sign at this nonce instead of the next one
+  --max-tx-fee    Most one transaction may pay for gas (fee cap x gas limit),
+                  in ETH. Default 1; 0 disables the check.
 
 Use these to replace a transaction that is stuck in the mempool: a replacement
 must reuse the stuck nonce and outbid it (roughly +10%), and the fees computed
@@ -1840,6 +1844,7 @@ from a quote are the same ones that got stuck. Check the stuck nonce with
         maxFeeWei: options['max-fee'] !== undefined
           ? parseGweiToWei(options['max-fee'], 'max-fee')
           : null,
+        maxTxFeeWei: parseMaxTxFeeOption(options['max-tx-fee']),
       };
       let nonceSequence = null;
       if (options.nonce !== undefined) {
