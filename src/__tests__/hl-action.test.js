@@ -198,9 +198,6 @@ describe('zero-rounded order values', () => {
   });
 });
 
-// perp.js documents that every input guard throws a coded CommandError so an
-// agent can branch on `code`; the TP/SL side checks were the one set that
-// still threw a bare Error with code undefined.
 // --price / --size accept a plain digit string, so a 22-digit value reaches
 // the builders as 1e21 without any exponent syntax in the CLI argument.
 describe('order values that cannot be rendered as decimals', () => {
@@ -249,6 +246,9 @@ describe('order values that cannot be rendered as decimals', () => {
   });
 });
 
+// perp.js documents that every input guard throws a coded CommandError so an
+// agent can branch on `code`; the TP/SL side checks were the one set that
+// still threw a bare Error with code undefined.
 describe('take-profit / stop-loss side validation', () => {
   const long = params => buildOrderAction({ isBuy: true, orderType: 'limit', size: 0.01, price: 2000, ...params }, ETH);
   const short = params => buildOrderAction({ isBuy: false, orderType: 'limit', size: 0.01, price: 2000, ...params }, ETH);
