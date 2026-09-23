@@ -268,7 +268,7 @@
     },
     "bridge": {
       "description": "Move funds between Base and Hyperliquid",
-      "notes": "Supported routes: base -> hyperliquid (deposit); hyperliquid -> base, hyperliquid -> ethereum, hyperliquid -> arbitrum (withdrawal). Any other combination is rejected. Deposits broadcast an EVM transaction from the local wallet, so they require a locally signable origin chain; withdrawals sign a Hyperliquid action and never transact on the destination chain.",
+      "notes": "Supported routes: base -> hyperliquid (deposit); hyperliquid -> base, hyperliquid -> ethereum, hyperliquid -> arbitrum (withdrawal). Any other combination is rejected. base -> hyperliquid deposits currently support USDC only — a non-USDC --from-token is rejected with INVALID_INPUT before the quote is created. Deposits broadcast an EVM transaction from the local wallet, so they require a locally signable origin chain; withdrawals sign a Hyperliquid action and never transact on the destination chain.",
       "routes": [
         {
           "origin": "base",
@@ -319,7 +319,7 @@
             "from-token": {
               "type": "string",
               "required": true,
-              "description": "Source token symbol (USDC) or address (alias: --token)"
+              "description": "Source token symbol or address (alias: --token). Base -> Hyperliquid deposits require USDC; a non-USDC token is rejected before the quote is created."
             },
             "to-token": {
               "type": "string",
@@ -1155,7 +1155,7 @@
                 },
                 "search": {
                   "type": "string",
-                  "description": "Filter screener candidates client-side by token name, symbol, or exact address. With --paginate/--all, the fully traversed candidate pool is filtered after traversal; pagination metadata describes the upstream candidate-page traversal, not the number of matches after filtering."
+                  "description": "Filter screener candidates client-side by token name, symbol, or exact address. Only the fetched candidate rows are searched (the first 500 by default, more with --limit/--page, every traversed page with --paginate/--all), so the response adds _meta.search: { query, searched, matched, complete }. complete: false means the API had more rows beyond that window and a missing token may simply rank below it; widen with --limit (max 1000) or --paginate, or narrow with --filters. A stderr note repeats this for --fields/--table/--csv/--stream output. With --paginate/--all, the fully traversed candidate pool is filtered after traversal; pagination metadata describes the upstream candidate-page traversal, not the number of matches after filtering."
                 }
               }
             },
@@ -2671,6 +2671,64 @@
           ]
         }
       }
+    },
+    "cache": {
+      "description": "Inspect and clear the caches the CLI keeps under ~/.nansen. Reads and deletes local files only: no network call, no credits, and credentials, wallets, saved quotes and config are never changed. CLI startup loads the saved config as usual.",
+      "subcommands": {
+        "stats": {
+          "description": "Report what each cache holds: entry count, bytes on disk, age of the oldest and newest entry, the effective TTL, and how many entries are already expired. Aggregates only — no cached payload, request parameter or cache key is printed.",
+          "options": {
+            "json": {
+              "type": "boolean",
+              "description": "Return the stats as a JSON object instead of a text report"
+            },
+            "cache-ttl": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "default": 300,
+              "description": "TTL to evaluate the response cache against, matching the TTL a request would use"
+            }
+          },
+          "returns": [
+            "config_dir",
+            "caches[].name",
+            "caches[].description",
+            "caches[].path",
+            "caches[].entries",
+            "caches[].bytes",
+            "caches[].ttl_seconds",
+            "caches[].oldest_age_seconds",
+            "caches[].newest_age_seconds",
+            "caches[].expired_entries",
+            "total_entries",
+            "total_bytes",
+            "hit_miss_recorded"
+          ],
+          "examples": [
+            "nansen cache stats",
+            "nansen cache stats --json --pretty",
+            "nansen cache stats --cache-ttl 60"
+          ]
+        },
+        "clear": {
+          "description": "Delete cached entries and print exactly what was removed. Takes an explicit target: responses (the default), cost-map, update-check, or all. An unrecognised target removes nothing.",
+          "args": [
+            {
+              "name": "target",
+              "type": "string",
+              "default": "responses",
+              "enum": ["responses", "cost-map", "update-check", "all"],
+              "description": "Which cache to delete"
+            }
+          ],
+          "examples": [
+            "nansen cache clear",
+            "nansen cache clear cost-map",
+            "nansen cache clear all"
+          ]
+        }
+      }
     }
   },
   "globalOptions": {
@@ -2717,6 +2775,14 @@
       "default": 3,
       "description": "Max retry attempts (non-negative safe integer)"
     },
+    "cache": {
+      "type": "boolean",
+      "description": "Serve this invocation from the local response cache and save its result there. Off by default; see the caching section for which commands it applies to"
+    },
+    "no-cache": {
+      "type": "boolean",
+      "description": "Bypass the local response cache for this invocation even when --cache is passed. NANSEN_NO_CACHE=1 does the same without a flag"
+    },
     "cache-ttl": {
       "type": "integer",
       "minimum": 0,
@@ -2740,6 +2806,51 @@
       "type": "string",
       "description": "Pre-signed x402 payment signature header"
     }
+  },
+  "caching": {
+    "summary": "Response caching is off by default and opt-in per invocation with --cache. It is a property of the request path, not of individual commands: with --cache on, every read the CLI makes through the Nansen API client is served from and written to the local response cache.",
+    "enableWith": "--cache",
+    "disableWith": ["--no-cache", "NANSEN_NO_CACHE=1"],
+    "ttlOption": "--cache-ttl <seconds>",
+    "defaultTtlSeconds": 300,
+    "cachedCommands": "All research commands (including top-level perp screener and perp leaderboard), plus alerts list and alerts get.",
+    "neverCached": [
+      "account",
+      "web search",
+      "web fetch",
+      "alerts create",
+      "alerts update",
+      "alerts toggle",
+      "alerts delete",
+      "agent",
+      "trade (all subcommands)",
+      "bridge (all subcommands)",
+      "wallet (all subcommands)",
+      "perp trading (order, cancel, close, leverage, transfer, approve-builder-fee, positions, orders, account, meta)",
+      "mcp (all subcommands)"
+    ],
+    "inspect": "nansen cache stats",
+    "clear": "nansen cache clear [responses|cost-map|update-check|all]",
+    "caches": [
+      {
+        "name": "responses",
+        "path": "~/.nansen/cache",
+        "ttlSeconds": 300,
+        "description": "API responses saved when --cache is passed; TTL is the effective --cache-ttl"
+      },
+      {
+        "name": "cost-map",
+        "path": "~/.nansen/cost-map.json",
+        "ttlSeconds": 86400,
+        "description": "Per-endpoint credit costs used to report what a call cost"
+      },
+      {
+        "name": "update-check",
+        "path": "~/.nansen/update-check.json",
+        "ttlSeconds": 86400,
+        "description": "Latest published CLI version, for the upgrade notice"
+      }
+    ]
   },
   "chains": [
     "algorand",
