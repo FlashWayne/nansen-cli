@@ -138,3 +138,5 @@ nansen alerts create \
 - `--data '<json>'` merges raw JSON on top of named flags (escape hatch for fields without named flags).
 - Alert endpoints are internal-only. Non-internal users receive 404.
 - Use single quotes for names with `$` or special characters: `--name 'SM >$1M'`
+
+Browser login uses `nansen:api` with the same account API permissions as an API key, subject to existing plan/account/endpoint checks. Trading still requires a separately configured wallet and its signing authorization. Hosted simulation uses the selected credential only on the matching trusted Nansen API origin; arbitrary RPC endpoints never receive Nansen credentials.
