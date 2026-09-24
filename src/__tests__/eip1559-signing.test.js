@@ -253,6 +253,15 @@ describe('parseMaxTxFeeOption', () => {
       expect(() => parseMaxTxFeeOption(bad), bad).toThrow(/Invalid --max-tx-fee/);
     }
   });
+
+  // parseArgs JSON-parses option values and accumulates a repeated option into
+  // an array, so String() would turn `--max-tx-fee '[0]'` into "0" and disable
+  // the cap without saying so.
+  it('refuses a non-scalar value instead of coercing it', () => {
+    for (const bad of [[0], [2], ['0'], {}, true]) {
+      expect(() => parseMaxTxFeeOption(bad), JSON.stringify(bad)).toThrow(/single value in ETH/);
+    }
+  });
 });
 
 describe('signEvmTransaction fee ceiling', () => {

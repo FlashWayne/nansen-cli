@@ -1837,6 +1837,11 @@ from a quote are the same ones that got stuck. Check the stuck nonce with
       // Fee/nonce overrides. Parsed before the quote is touched so a typo can't
       // consume it, and only applied to EVM legs — an HL withdrawal signs an
       // action with no fee fields at all.
+      // A bare --max-tx-fee lands in flags, not options, so it would otherwise
+      // read as "not given" and silently apply the default cap.
+      if (flags['max-tx-fee']) {
+        throw new CommandError('--max-tx-fee requires a value in ETH (e.g. 0.5), or 0 for no cap.', 'INVALID_INPUT');
+      }
       const feeOverrides = {
         priorityFeeWei: options['priority-fee'] !== undefined
           ? parseGweiToWei(options['priority-fee'], 'priority-fee')

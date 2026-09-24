@@ -2431,6 +2431,15 @@ describe('EVM swap gas zero fallback (execute)', () => {
     await expect(cmds.execute([], screenApi, {}, { quote: 'whatever', 'max-tx-fee': '-1' }))
       .rejects.toThrow(/Invalid --max-tx-fee/);
   });
+
+  // parseArgs puts a value-less option in flags, not options, so without this
+  // `--max-tx-fee` on its own would read as "not given" and quietly apply the
+  // default cap while the user believes they set one.
+  it('rejects a bare --max-tx-fee rather than silently defaulting', async () => {
+    const cmds = buildTradingCommands({ log: () => {}, exit: () => {} });
+    await expect(cmds.execute([], screenApi, { 'max-tx-fee': true }, { quote: 'whatever' }))
+      .rejects.toThrow(/--max-tx-fee requires a value/);
+  });
 });
 
 // ============= Privy execute support =============

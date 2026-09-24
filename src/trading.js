@@ -847,6 +847,14 @@ const FALLBACK_SWAP_GAS_LIMIT = 210000;
  */
 export function parseMaxTxFeeOption(raw) {
   if (raw === undefined || raw === null) return MAX_EVM_TX_FEE_WEI;
+  // String() would coerce a repeated or JSON-shaped option into something that
+  // parses: `--max-tx-fee '[0]'` becomes "0" and silently disables the cap.
+  if (typeof raw !== 'string' && typeof raw !== 'number') {
+    throw new CommandError(
+      `--max-tx-fee takes a single value in ETH (e.g. 0.5), or 0 for no cap.`,
+      'INVALID_INPUT',
+    );
+  }
   const s = String(raw).trim();
   const match = /^(\d*)(?:\.(\d{1,18}))?$/.exec(s);
   if (!match || (match[1] === '' && match[2] === undefined)) {
@@ -2985,7 +2993,12 @@ CROSS-CHAIN NOTES (when using --to-chain):
       const noRevokeExcessiveAllowance = flags['no-revoke-excessive-allowance'];
       const noVerifyOutcome = flags['no-verify-outcome'];
       const gasless = Boolean(flags.gasless);
-      // Parsed before the quote is touched so a typo can't consume it.
+      // Parsed before the quote is touched so a typo can't consume it. A bare
+      // --max-tx-fee lands in flags, not options, so it would otherwise read as
+      // "not given" and silently apply the default cap.
+      if (flags['max-tx-fee']) {
+        throw new CommandError('--max-tx-fee requires a value in ETH (e.g. 0.5), or 0 for no cap.', 'INVALID_INPUT');
+      }
       const maxTxFeeWei = parseMaxTxFeeOption(options['max-tx-fee']);
       const guard = resolveExecuteGuard(flags, { env, isTTY });
       // Read the API key for the swap-outcome sim endpoint. It's optional (the
@@ -3465,7 +3478,9 @@ EXAMPLES:
                 } else {
                   const { maxFeePerGas: approvalMaxFee, maxPriorityFeePerGas: approvalPriorityFee } =
                     resolveQuoteEip1559Fees(currentQuote.transaction);
-                  assertEvmFeeWithinCap(approvalMaxFee, APPROVAL_GAS_LIMIT, 'approval', maxTxFeeWei);
+                  // One check covers the revoke and the approval (same fee, same
+                  // gas limit); name whichever is sent first.
+                  assertEvmFeeWithinCap(approvalMaxFee, APPROVAL_GAS_LIMIT, shouldRevoke ? 'allowance revoke' : 'approval', maxTxFeeWei);
 
                   if (shouldRevoke) {
                     log(`  ⚠ Existing allowance (${existingAllowance}) for ${quoteName} is excessive (>${OVERSIZED_ALLOWANCE_MULTIPLIER}x this trade) — revoking before re-approving`);
