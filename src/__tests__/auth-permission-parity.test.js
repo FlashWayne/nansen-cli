@@ -16,7 +16,7 @@ const dirs = []; const original = SIMULATION_RPCS.base;
 afterEach(() => { vi.unstubAllGlobals(); SIMULATION_RPCS.base = original; for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 async function selected(kind, audience = 'https://api.nansen.ai') {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'auth-parity-')); dirs.push(home);
-  const state = createAuthState({ directory: path.join(home, '.nansen'), store: createAuthStore(memoryOperation()) });
+  const state = createAuthState({ directory: path.join(home, '.nansen'), store: createAuthStore(memoryOperation()), retire: async () => ({ remote: 'recorded_pending' }) });
   const bundle = sessionFixture({ audience });
   if (kind !== 'anonymous') {
     const a = await state.begin();
@@ -41,7 +41,7 @@ it.each(['api-key', 'session'])('smart-alert CRUD and hosted trade simulation us
   }
 });
 it.each(['https://rpc.example.test', 'https://api.nansen.ai.evil.test', 'http://api.nansen.ai', 'https://api.nansen.ai:8443', 'https://user:password@api.nansen.ai'])('never forwards browser custody to custom RPC %s', async url => {
-  const { api, state } = await selected('session'); const read = vi.spyOn(state, 'readSession');
+  const { api, state } = await selected('session'); const read = vi.spyOn(state, 'acquireSession');
   SIMULATION_RPCS.base = url; const fetch = vi.fn(async () => sim()); vi.stubGlobal('fetch', fetch);
   await simulateAssetChanges('base', { to: '0x2' }, { from: '0x1', api });
   expect(read).not.toHaveBeenCalled(); expect(fetch.mock.calls[0][1].headers).toEqual({ 'Content-Type': 'application/json' });
@@ -96,7 +96,7 @@ it('matching staging simulation resolves the staging session and refuses an extr
 it.each(['anonymous', 'api-key', 'session'].flatMap(kind => [401, 403].map(status => [kind, status])))('actual swap verification preserves %s behavior on hosted HTTP%s', async (kind, status) => {
   const { api, state, bundle } = await selected(kind);
   expect(api.selection.kind).toBe(kind);
-  const read = vi.spyOn(state, 'readSession');
+  const read = vi.spyOn(state, 'acquireSession');
   const payment = vi.spyOn(api, '_x402Retry');
   const fetch = vi.fn(async () => new Response(JSON.stringify({ message: 'synthetic denial' }), { status }));
   vi.stubGlobal('fetch', fetch);

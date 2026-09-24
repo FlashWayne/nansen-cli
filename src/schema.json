@@ -2471,6 +2471,7 @@
             "saved_session.expired",
             "saved_session.validity",
             "saved_session.storage_access",
+            "saved_session.renewal_state",
             "api_key.present",
             "api_key.source",
             "api_key.masked",

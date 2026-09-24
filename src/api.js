@@ -752,9 +752,10 @@ export class NansenAPI {
     assertUsableSelection(this.selection);
     if (this.selection.kind === 'session') {
       if (Object.keys(extraHeaders || {}).some(k => ['apikey', 'authorization', 'payment-signature'].includes(k.toLowerCase()))) throw new AuthError('MIXED_CREDENTIALS', 'Send the selected browser session alone.');
-      const bundle = await (this.authState || createAuthState()).readSession(this.selection);
+      const bundle = await (this.authState || (this.authState = createAuthState())).acquireSession(this.selection, { audience: this.baseUrl });
       validateSession(bundle);
       if (bundle.audience !== this.baseUrl || bundle.accountId !== this.selection.accountId || bundle.issuer !== this.selection.issuer) throw new AuthError('AUTH_ORIGIN_MISMATCH', 'The saved session does not match the selected API origin/account. Check NANSEN_BASE_URL or run nansen login.');
+      this.selection = { ...this.selection, generation: bundle.generation, expiresAt: bundle.expiresAt };
       return { Authorization: `Bearer ${bundle.accessToken}` };
     }
     return this.apiKey ? { apikey: this.apiKey } : {};
@@ -892,7 +893,7 @@ export class NansenAPI {
   async request(endpoint, body = {}, options = {}) {
     this.lastEndpoint = endpoint;
     const extraHeaders = { ...this.defaultHeaders, ...options.headers };
-    const credentialHeaders = await this.requestCredentials(extraHeaders);
+    let credentialHeaders = await this.requestCredentials(extraHeaders);
     const mayAutoPay = this.allowPayment && this.selection.kind === 'anonymous' && !Object.keys(extraHeaders).some(k => ['apikey', 'authorization'].includes(k.toLowerCase()));
     const url = `${this.baseUrl}${endpoint}`;
     const { maxRetries, baseDelayMs, maxDelayMs, maxRetryAfterMs, retryOnStatus } = this.retryOptions;
@@ -906,7 +907,7 @@ export class NansenAPI {
     // cacheContext is therefore null unless caching is on; the `&& cacheContext`
     // guards below ensure that null never reaches getCacheKey, where a missing
     // identity would silently produce a credential-agnostic (shared) cache key.
-    const cacheContext = useCache
+    const credentialContext = () => useCache
       ? {
           baseUrl: `${this.baseUrl}#${this.selection.generation || ""}`,
           method,
@@ -914,6 +915,7 @@ export class NansenAPI {
         }
       : null;
 
+    let cacheContext = credentialContext();
     if (useCache && cacheContext) {
       const cached = getCachedResponse(endpoint, body, cacheTtl, cacheContext);
       if (cached) {
@@ -931,6 +933,12 @@ export class NansenAPI {
     // Bound the loop by the displayed attempt count so retry:false can never
     // produce a trace such as attempt=2/1, even if a future branch continues.
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      // Backoff may cross expiry or a competing rotation/logout. Reacquire
+      // before dispatch, outside the resource network-error retry handler.
+      if (this.selection.kind === 'session' && (attempt > 0 || this.selection.expiresAt <= Date.now())) {
+        credentialHeaders = await this.requestCredentials(extraHeaders);
+        cacheContext = credentialContext();
+      }
       let response;
       const startedAt = Date.now();
       traceRequest({ method, url, attempt: attempt + 1, maxAttempts });
