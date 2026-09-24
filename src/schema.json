@@ -427,7 +427,7 @@
       }
     },
     "research": {
-      "description": "Research and analytics commands. Explicitly blank chain, timeframe, and days options are rejected instead of selecting defaults. Profiler batch rejects blank --delay; trace rejects blank --delay, --depth, and --width.",
+      "description": "Research and analytics commands. Explicitly blank chain, timeframe, and days options are rejected instead of selecting defaults. Profiler batch rejects blank --delay; trace rejects blank --delay, --depth, and --width. Browser nansen:api sessions use the same account API permissions and endpoint checks as API keys.",
       "subcommands": {
         "portfolio": {
           "subcommands": {
@@ -2454,7 +2454,7 @@
     },
     "account": {
       "endpoint": "/api/v1/account",
-      "description": "Show API key status, plan, and remaining credits. Does not consume credits."
+      "description": "Check the effective credential, plan, and remaining credits live. Free, including for a valid zero-credit account. NANSEN_API_KEY overrides saved authentication."
     },
     "auth": {
       "description": "Offline authentication status. Reports effective credential source, cached/unverified browser session metadata, API key presence, base URL, and x402 wallet readiness without any network call. Consumes no credits.",
@@ -2690,7 +2690,7 @@
       }
     },
     "login": {
-      "description": "Fresh browser approval for API-key-equivalent account API permissions (nansen:api); securely save a revocable session. Wallet signing stays separate. Plain login never persists NANSEN_API_KEY; it still overrides commands. Prerelease only; expired sessions require login until renewal ships.",
+      "description": "Fresh browser approval in every starting state for API-key-equivalent account API permissions (nansen:api). Wallet signing and MCP key export remain separate. Plain login never persists NANSEN_API_KEY; it still overrides commands. Selected sessions renew automatically; uncertain renewal requires fresh login. Native custody and enabled server admission required; release acceptance pending.",
       "options": {
         "no-browser": {
           "type": "boolean",

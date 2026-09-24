@@ -1098,8 +1098,8 @@ COMMANDS:
   alerts      list, create, update, toggle, delete
   web         search, fetch
   mcp         install/uninstall/verify the Nansen MCP server
-  account     Show API key status, plan, and remaining credits
-  auth        status — offline auth status: key source, wallets (no network)
+  account     Check the effective credential, plan, and remaining credits (free)
+  auth        status — offline credential source and cached/unverified session metadata
   login       Sign in through browser approval (--no-browser for remote terminals)
   logout      Remove saved API authentication; preserve wallets
   doctor      Diagnostics: auth, wallets, caches, connectivity (--offline --json)
@@ -1115,6 +1115,18 @@ RETRY:   --no-retry --retries N --cache --cache-ttl N
 DEBUG:   --debug (or NANSEN_DEBUG=1) traces each request on stderr: method, URL,
          status, time-to-headers (TTFB), retries, request id. Never prints
          credentials or bodies.
+
+AUTHENTICATION:
+  nansen login                 Fresh browser approval, even with an existing key/session
+  nansen login --no-browser    Same approval without opening the browser
+  nansen auth status           Offline, cached/unverified; does not open session storage
+  nansen account               Free live check of the effective credential
+  nansen login --human         Explicit legacy key setup; also persists an injected env key
+  NANSEN_API_KEY overrides saved authentication. Selected credentials never auto-pay.
+  Browser sessions renew automatically; uncertain renewal requires fresh login.
+  Browser nansen:api sessions have API-key-equivalent account permissions; wallet signing is separate.
+  Browser login needs native storage and enabled server admission; release gates remain open.
+  Public API endpoints keep their usual account, plan and credit checks; MCP key export is separate.
 
 TRADING:
   nansen trade quote --chain solana --from SOL --to USDC --amount 1000000000
@@ -1553,7 +1565,7 @@ export function buildCommands(deps = {}) {
           let resolution = ['Check your internet connection', 'Try again'];
           if (error.code === ErrorCode.RATE_LIMITED) {
             message = 'Rate limited while verifying the API key.';
-            resolution = ['Wait a moment, then run nansen login again'];
+            resolution = ['Wait a moment, then retry explicit key setup: nansen login --human'];
           } else if (error.code === ErrorCode.SERVER_ERROR || error.code === ErrorCode.SERVICE_UNAVAILABLE) {
             message = 'The Nansen API is unavailable right now, so the key could not be verified.';
             resolution = ['Try again shortly'];
