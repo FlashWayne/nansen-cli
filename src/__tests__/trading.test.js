@@ -11,13 +11,13 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { spawnSync } from 'child_process';
 import {
   resolveChain,
   getWalletChainType,
   saveQuote,
   loadQuote,
   claimQuoteForExecution,
+  markQuoteExecuted,
   cleanupQuotes,
   readCompactU16,
   toBuffer,
@@ -331,115 +331,98 @@ describe('quote storage', () => {
   // call it believes timed out) therefore both passed the check and could
   // each sign and broadcast; on Solana no shared nonce stops the second one.
   describe('execution claim', () => {
-    it('refuses a second claim while the first is held', () => {
+    const quotesDir = () => path.join(tempDir, '.nansen', 'quotes');
+    const quoteFile = id => path.join(quotesDir(), `${id}.json`);
+    const claimedFile = id => path.join(quotesDir(), `${id}.executing.json`);
+
+    it('claims by renaming the quote away, so a second claim fails', () => {
       const quoteId = saveQuote(solanaQuoteResponse, 'solana');
-      const release = claimQuoteForExecution(quoteId);
+      const claim = claimQuoteForExecution(quoteId);
       try {
+        expect(claim.quote.quoteId).toBe(quoteId);
+        expect(fs.existsSync(quoteFile(quoteId))).toBe(false);
+        expect(fs.existsSync(claimedFile(quoteId))).toBe(true);
         expect(() => claimQuoteForExecution(quoteId))
-          .toThrow(/already being executed.*check the explorer before retrying/s);
+          .toThrow(/claimed by another execution.*executing\.json.*check the wallet on the explorer/s);
+        expect(() => loadQuote(quoteId)).toThrow(/claimed by another execution/);
       } finally {
-        release();
+        claim.release();
       }
     });
 
-    it('lets the quote be claimed again after the first run releases', () => {
+    it('hands the quote back when no swap left the process', () => {
       const quoteId = saveQuote(solanaQuoteResponse, 'solana');
-      claimQuoteForExecution(quoteId)();
-      const again = claimQuoteForExecution(quoteId);
-      expect(typeof again).toBe('function');
-      again();
+      claimQuoteForExecution(quoteId).release();
+      expect(fs.existsSync(quoteFile(quoteId))).toBe(true);
+      expect(fs.existsSync(claimedFile(quoteId))).toBe(false);
+      claimQuoteForExecution(quoteId).release();
+    });
+
+    it('hands back a broadcast quote only once its marker is recorded', () => {
+      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
+      const claim = claimQuoteForExecution(quoteId);
+      markQuoteExecuted(quoteId, { broadcast: { txHash: 'sig-1' } });
+      claim.release({ handedOff: true });
+      expect(() => loadQuote(quoteId)).toThrow(/already executed.*sig-1/s);
+    });
+
+    // markQuoteExecuted is best-effort, and a failed /execute may still have
+    // broadcast. With no marker, the quote stays claimed: a retry is refused
+    // rather than risk a second swap.
+    it('keeps the quote claimed when a swap left the process with no marker', () => {
+      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
+      claimQuoteForExecution(quoteId).release({ handedOff: true });
+      expect(fs.existsSync(claimedFile(quoteId))).toBe(true);
+      expect(() => loadQuote(quoteId)).toThrow(/claimed by another execution/);
+      expect(() => claimQuoteForExecution(quoteId)).toThrow(/claimed by another execution/);
+    });
+
+    it('re-reads the quote under the claim and refuses one that was executed meanwhile', () => {
+      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
+      loadQuote(quoteId); // this run's earlier read
+      markQuoteExecuted(quoteId, { broadcast: { txHash: 'sig-other' } }); // another run
+      expect(() => claimQuoteForExecution(quoteId)).toThrow(/already executed.*sig-other/s);
+      // Nothing was signed, so the quote is not left claimed.
+      expect(fs.existsSync(claimedFile(quoteId))).toBe(false);
+      expect(fs.existsSync(quoteFile(quoteId))).toBe(true);
     });
 
     it('does not block a different quote', () => {
       const a = saveQuote(solanaQuoteResponse, 'solana');
       const b = saveQuote(solanaQuoteResponse, 'solana');
-      const releaseA = claimQuoteForExecution(a);
-      const releaseB = claimQuoteForExecution(b);
-      releaseA();
-      releaseB();
+      const claimA = claimQuoteForExecution(a);
+      const claimB = claimQuoteForExecution(b);
+      claimA.release();
+      claimB.release();
     });
 
-    // A pid that has already exited, rather than a magic number: the default
-    // pid_max on Linux is 2 ** 22, so a large constant can be a live process.
-    function deadPid() {
-      const { pid } = spawnSync(process.execPath, ['-e', '0']);
-      return pid;
-    }
-
-    it('reclaims a quote whose claiming process is gone', () => {
+    it('records the broadcast in the claimed file', () => {
       const quoteId = saveQuote(solanaQuoteResponse, 'solana');
-      const lockPath = path.join(tempDir, '.nansen', 'quotes', `${quoteId}.lock`);
-      fs.writeFileSync(lockPath, JSON.stringify({ pid: deadPid(), host: os.hostname(), at: Date.now() }));
-      const release = claimQuoteForExecution(quoteId);
-      expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid).toBe(process.pid);
-      release();
+      const claim = claimQuoteForExecution(quoteId);
+      markQuoteExecuted(quoteId, { broadcast: { txHash: 'sig-2' } });
+      const data = JSON.parse(fs.readFileSync(claimedFile(quoteId), 'utf8'));
+      expect(data.executedAt).toEqual(expect.any(Number));
+      expect(data.broadcasts.map(b => b.txHash)).toEqual(['sig-2']);
+      claim.release({ handedOff: true });
     });
 
-    it('reclaims a claim from this host with a damaged pid', () => {
-      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
-      const lockPath = path.join(tempDir, '.nansen', 'quotes', `${quoteId}.lock`);
-      fs.writeFileSync(lockPath, JSON.stringify({ pid: 'not-a-pid', host: os.hostname(), at: Date.now() }));
-      const release = claimQuoteForExecution(quoteId);
-      expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid).toBe(process.pid);
-      release();
-    });
-
-    it('reports a lost race for a stale claim instead of a bare EEXIST', () => {
-      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
-      const lockPath = path.join(tempDir, '.nansen', 'quotes', `${quoteId}.lock`);
-      fs.writeFileSync(lockPath, JSON.stringify({ pid: deadPid(), host: os.hostname(), at: Date.now() }));
-
-      // Stand in for the racer: it wins the exclusive create between this
-      // run's unlink and its own take().
-      const realUnlink = fs.unlinkSync;
-      const spy = vi.spyOn(fs, 'unlinkSync').mockImplementation((target) => {
-        realUnlink(target);
-        if (String(target) === lockPath) {
-          fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, host: os.hostname(), at: Date.now() }));
-        }
-      });
-      try {
-        expect(() => claimQuoteForExecution(quoteId))
-          .toThrow(/claimed by another process while this run was clearing a stale claim/);
-      } finally {
-        spy.mockRestore();
-        realUnlink(lockPath);
-      }
-    });
-
-    it('reclaims a claim older than the TTL from another host', () => {
-      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
-      const lockPath = path.join(tempDir, '.nansen', 'quotes', `${quoteId}.lock`);
-      fs.writeFileSync(lockPath, JSON.stringify({
-        pid: process.pid, host: 'some-other-host', at: Date.now() - 16 * 60 * 1000,
-      }));
-      const release = claimQuoteForExecution(quoteId);
-      expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).host).toBe(os.hostname());
-      release();
-    });
-
-    it('keeps a live claim from another host that is within the TTL', () => {
-      const quoteId = saveQuote(solanaQuoteResponse, 'solana');
-      const lockPath = path.join(tempDir, '.nansen', 'quotes', `${quoteId}.lock`);
-      fs.writeFileSync(lockPath, JSON.stringify({
-        pid: process.pid, host: 'some-other-host', at: Date.now() - 60 * 1000,
-      }));
-      expect(() => claimQuoteForExecution(quoteId)).toThrow(/already being executed/);
-      fs.unlinkSync(lockPath);
-    });
-
-    it('cleanupQuotes removes a stale claim but keeps a live one', () => {
-      const stale = saveQuote(solanaQuoteResponse, 'solana');
+    // The claim lives exactly as long as the quote: a quote left claimed
+    // after an interrupted run is removed with the other expired quotes,
+    // which also keeps a `trade quote` in another terminal from touching a
+    // live claim.
+    it('cleanupQuotes removes an expired claimed quote but keeps a live one', () => {
+      const expired = saveQuote(solanaQuoteResponse, 'solana');
       const live = saveQuote(solanaQuoteResponse, 'solana');
-      const quotesDir = path.join(tempDir, '.nansen', 'quotes');
-      fs.writeFileSync(path.join(quotesDir, `${stale}.lock`), JSON.stringify({
-        pid: deadPid(), host: os.hostname(), at: Date.now(),
-      }));
-      const release = claimQuoteForExecution(live);
-      cleanupQuotes();
-      expect(fs.existsSync(path.join(quotesDir, `${stale}.lock`))).toBe(false);
-      expect(fs.existsSync(path.join(quotesDir, `${live}.lock`))).toBe(true);
-      release();
+      const liveClaim = claimQuoteForExecution(live);
+      claimQuoteForExecution(expired).release({ handedOff: true });
+      const data = JSON.parse(fs.readFileSync(claimedFile(expired), 'utf8'));
+      data.timestamp = Date.now() - 2 * 3600000;
+      fs.writeFileSync(claimedFile(expired), JSON.stringify(data));
+
+      saveQuote(solanaQuoteResponse, 'solana'); // runs cleanupQuotes
+      expect(fs.existsSync(claimedFile(expired))).toBe(false);
+      expect(fs.existsSync(claimedFile(live))).toBe(true);
+      liveClaim.release();
     });
   });
 
