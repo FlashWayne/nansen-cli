@@ -42,20 +42,37 @@ export function parsePaymentRequirements(response) {
 }
 
 /**
- * Rank payment requirements. Prefers EVM (gasless) over Solana.
- * Returns all supported requirements in priority order.
+ * Rank payment requirements cheapest first.
+ *
+ * A 402 response may offer several options that are all individually valid
+ * and within the per-payment cap. The caller signs them in this order and
+ * stops at the first the server accepts, so the order decides what the wallet
+ * pays: server order alone let a merchant list an expensive option first and
+ * be paid it while a cheaper one for the same resource sat in the same
+ * response.
+ *
+ * Price comes from evaluatePaymentRequirement, the same function that later
+ * guards the payment, so ranking and policy cannot disagree. An option the
+ * policy refuses sorts last rather than being dropped here: the caller logs
+ * its reason when it tries and skips it.
+ *
+ * Ties keep the previous behaviour — EVM before Solana, then the server's own
+ * order — so a response whose options cost the same is unaffected.
  */
 function rankRequirements(requirements) {
-  const ranked = [];
-  // EVM first (gasless for client)
-  for (const r of requirements) {
-    if (isEvmNetwork(r.network)) ranked.push(r);
-  }
-  // Then Solana
-  for (const r of requirements) {
-    if (isSvmNetwork(r.network)) ranked.push(r);
-  }
-  return ranked;
+  return requirements
+    .filter(r => isEvmNetwork(r.network) || isSvmNetwork(r.network))
+    .map((requirement, index) => {
+      const decision = evaluatePaymentRequirement(requirement);
+      return {
+        requirement,
+        index,
+        rail: isEvmNetwork(requirement.network) ? 0 : 1,
+        usd: decision.ok && Number.isFinite(decision.usd) ? decision.usd : Number.POSITIVE_INFINITY,
+      };
+    })
+    .sort((a, b) => (a.usd - b.usd) || (a.rail - b.rail) || (a.index - b.index))
+    .map(entry => entry.requirement);
 }
 
 // ERC-20 allowance(owner, spender) selector for the Permit2 preflight.
@@ -100,6 +117,18 @@ async function buildPaymentForRequirement(requirement, exported, url) {
   const decision = evaluatePaymentRequirement(requirement);
   if (!decision.ok) {
     console.error(`[x402] ${decision.reason}`);
+    return null;
+  }
+
+  // exportWallet returns a null key for a chain the wallet file doesn't hold.
+  // Skip that option with a clear reason instead of failing on the missing key.
+  const rail = isEvmNetwork(requirement.network) ? 'evm' : 'solana';
+  if (!exported[rail]?.privateKey || !exported[rail]?.address) {
+    const chain = rail === 'evm' ? 'EVM' : 'Solana';
+    console.error(
+      `[x402] Skipping ${requirement.network} option: wallet "${exported.name}" has no ${chain} key. ` +
+      'Create a wallet with both keys (nansen wallet create) and make it the default (nansen wallet default <name>).',
+    );
     return null;
   }
 
@@ -194,8 +223,11 @@ export async function* createPaymentSignatures(response, url, options = {}) {
     try {
       const sig = await buildPaymentForRequirement(req, exported, url);
       if (sig) yield { signature: sig, network: req.network, asset: req.asset };
-    } catch {
-      // This payment option failed to build, try next
+    } catch (err) {
+      // This payment option failed to build; say why and try the next one
+      // (otherwise a malformed server option only surfaces as a generic
+      // payment failure once every option is exhausted).
+      console.error(`[x402] Skipping ${req.network} option: ${err?.message || err}`);
       continue;
     }
   }

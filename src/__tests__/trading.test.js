@@ -82,6 +82,9 @@ const RELAY_ROUTER = '0xf5042e6ffac5a625d4e7848e0b01373d8eb9e222';
 // is covered in trading-sanctions-screening.test.js). Tests here exercise other
 // behaviour, so they get an API instance whose screen always reports clean.
 const screenApi = {
+  baseUrl: 'https://api.nansen.ai',
+  selection: { kind: 'anonymous' },
+  requestCredentials: async () => ({}),
   request: async (endpoint, body) => {
     if (endpoint.startsWith('/api/v1/sanctions/screen')) {
       return { results: (body?.addresses || []).map(address => ({ address, sanctioned: false })) };
@@ -945,6 +948,20 @@ describe('buildApprovalTransaction', () => {
     const wallet = generateEvmWallet();
     expect(() => buildApprovalTransaction('0xabc', '0xdef', wallet.privateKey, 'polygon', 0))
       .toThrow('Unsupported chain');
+  });
+
+  it('should refuse an approval whose gas price is anomalous', () => {
+    const wallet = generateEvmWallet();
+    // 20,000 gwei x the fixed 100k approval gas = 2 ETH for one approval.
+    expect(() => buildApprovalTransaction(
+      '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+      '0x57df6092665eb6058de53939612413ff4b09114e',
+      wallet.privateKey,
+      'base',
+      0,
+      '20000000000000',
+      1000000n,
+    )).toThrow(/for this approval.*fee cap.*Refusing to sign/s);
   });
 
   // An approval used to default to 1,000,000 wei (0.001 gwei) when the quote
@@ -2194,9 +2211,10 @@ describe('EVM swap gas zero fallback (execute)', () => {
     expect(logs.some(l => l.includes('Sufficient allowance exists for #1, skipping approval'))).toBe(true);
     expect(logs.some(l => l.includes('Using estimated gas 31500 (quote had no gas)'))).toBe(true);
 
+    // The quote's zero gas limit can't be signed at all, so the broadcast tx
+    // necessarily carries the resolved one.
     const exported = exportWallet('default', 'testpass');
-    const zeroGasSigned = signEvmTransaction(zeroGasErc20Tx(), exported.evm.privateKey, 'base', 5);
-    expect(executeBodies[0].signedTransaction).not.toBe(zeroGasSigned);
+    expect(() => signEvmTransaction(zeroGasErc20Tx(), exported.evm.privateKey, 'base', 5)).toThrow(/invalid gas limit/);
     expect(executeBodies[0].signedTransaction.startsWith('0x02')).toBe(true);
   });
 
@@ -2453,6 +2471,97 @@ describe('EVM swap gas zero fallback (execute)', () => {
 
     expect(rpcMethods).not.toContain('eth_estimateGas');
     expect(logs.some(l => l.includes('quote had no gas'))).toBe(false);
+  });
+
+  // The swap's fee is checked before the approval. An approval is capped
+  // against its own 100k gas, so 5,000 gwei passes for it (0.5 ETH) while the
+  // 300k-gas swap (1.5 ETH) is over the 1 ETH cap: checking only at signing
+  // time would pay for the approval and grant the allowance first.
+  function highFeeErc20Quote(walletAddress, walletType, extraArgs = [null]) {
+    return saveQuote({
+      success: true,
+      quotes: [{
+        aggregator: 'lifi',
+        inputMint: BASE_USDC,
+        outputMint: BASE_ETH,
+        inAmount: '100000',
+        inputAmount: '100000',
+        outAmount: '44000000000000',
+        approvalAddress: LIFI_ROUTER,
+        transaction: zeroGasErc20Tx({ gas: '300000', maxFeePerGas: '5000000000000', maxPriorityFeePerGas: '1000000' }),
+      }],
+    }, 'base', walletType, ...extraArgs, null, {
+      swapMode: 'exactIn',
+      request: evmIntent({
+        walletAddress,
+        fromToken: BASE_USDC,
+        toToken: BASE_ETH,
+        amount: '100000',
+        maxInputAmount: '100000',
+      }),
+    });
+  }
+
+  it('local wallet: refuses the swap fee before sending the approval', async () => {
+    createWallet('default', 'testpass');
+    process.env.NANSEN_WALLET_PASSWORD = 'testpass';
+    __setAllowanceTimingForTests({ verifyDelayMs: 0, propagationDelayMs: 0 });
+    const { executeBodies } = stubGasFallbackFetch({ allowance: 0n });
+    const quoteId = highFeeErc20Quote(showWallet('default').evm, 'local');
+
+    const logs = [];
+    const cmds = buildTradingCommands({ log: (msg) => logs.push(msg), exit: () => {} });
+    await expect(cmds.execute([], screenApi, { 'no-simulate': true, 'no-verify-outcome': true }, { quote: quoteId }))
+      .rejects.toThrow();
+
+    expect(executeBodies).toHaveLength(0);
+    expect(logs.some(l => l.includes('Sending approval tx'))).toBe(false);
+    expect(logs.some(l => /1500000000000000000 wei of gas for this swap.*fee cap/.test(l))).toBe(true);
+  });
+
+  it('Privy: refuses the swap fee before sending the approval', async () => {
+    process.env.PRIVY_APP_ID = 'test-app-id';
+    process.env.PRIVY_APP_SECRET = 'test-secret';
+    __setAllowanceTimingForTests({ verifyDelayMs: 0, propagationDelayMs: 0 });
+    const { executeBodies, privyTransactions } = stubGasFallbackFetch({ allowance: 0n });
+    const quoteId = highFeeErc20Quote('0xPrivyAddr', 'privy', [{ evm: 'wl_evm_1', solana: 'wl_sol_1' }]);
+
+    const logs = [];
+    const cmds = buildTradingCommands({ log: (msg) => logs.push(msg), exit: () => {} });
+    await expect(cmds.execute([], screenApi, { 'no-simulate': true, 'no-verify-outcome': true }, { quote: quoteId }))
+      .rejects.toThrow();
+
+    expect(privyTransactions).toHaveLength(0);
+    expect(executeBodies).toHaveLength(0);
+    expect(logs.some(l => /1500000000000000000 wei of gas for this swap.*fee cap/.test(l))).toBe(true);
+  });
+
+  it('local wallet: --max-tx-fee raises the cap', async () => {
+    createWallet('default', 'testpass');
+    process.env.NANSEN_WALLET_PASSWORD = 'testpass';
+    __setAllowanceTimingForTests({ verifyDelayMs: 0, propagationDelayMs: 0 });
+    const { executeBodies } = stubGasFallbackFetch({ allowance: 300000n });
+    const quoteId = highFeeErc20Quote(showWallet('default').evm, 'local');
+
+    const cmds = buildTradingCommands({ log: () => {}, exit: () => {} });
+    await cmds.execute([], screenApi, { 'no-simulate': true, 'no-verify-outcome': true }, { quote: quoteId, 'max-tx-fee': '2' });
+
+    expect(executeBodies).toHaveLength(1);
+  });
+
+  it('rejects an invalid --max-tx-fee before touching the quote', async () => {
+    const cmds = buildTradingCommands({ log: () => {}, exit: () => {} });
+    await expect(cmds.execute([], screenApi, {}, { quote: 'whatever', 'max-tx-fee': '-1' }))
+      .rejects.toThrow(/Invalid --max-tx-fee/);
+  });
+
+  // parseArgs puts a value-less option in flags, not options, so without this
+  // `--max-tx-fee` on its own would read as "not given" and quietly apply the
+  // default cap while the user believes they set one.
+  it('rejects a bare --max-tx-fee rather than silently defaulting', async () => {
+    const cmds = buildTradingCommands({ log: () => {}, exit: () => {} });
+    await expect(cmds.execute([], screenApi, { 'max-tx-fee': true }, { quote: 'whatever' }))
+      .rejects.toThrow(/--max-tx-fee requires a value/);
   });
 });
 
@@ -3455,6 +3564,47 @@ describe('quote command with --amount-unit usd', () => {
     expect(amount).toMatch(/^\d+$/);
     // Should NOT contain amountUnit in URL
     expect(quoteCall.url).not.toContain('amountUnit');
+
+    global.fetch = origFetch;
+    delete process.env.NANSEN_WALLET_PASSWORD;
+  });
+
+  // validateQuoteInput checks the raw dollar figure (positive), then the usd
+  // branch pre-rounds with toFixed(decimals) before convertToBaseUnits sees
+  // the value — so its "meaningful digits lost" guard never fires and a tiny
+  // but positive --amount silently became amount=0 in the quote request.
+  it('should refuse a USD amount that rounds to zero base units', async () => {
+    createWallet('default', 'testpass');
+    process.env.NANSEN_WALLET_PASSWORD = 'testpass';
+
+    const origFetch = global.fetch;
+    const fetchCalls = [];
+    global.fetch = vi.fn(async (url, opts) => {
+      fetchCalls.push({ url: url.toString(), opts });
+      return { ok: true, text: async () => JSON.stringify({ success: true, quotes: [] }) };
+    });
+
+    const mockApiInstance = {
+      request: screenApi.request,
+      generalSearch: vi.fn().mockResolvedValue({
+        tokens: [{ address: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', chain: 'solana', price: 1 }],
+      }),
+    };
+
+    const cmds = buildTradingCommands({ log: vi.fn(), exit: vi.fn() });
+    await expect(cmds.quote([], mockApiInstance, {}, {
+      chain: 'solana',
+      from: 'USDC',
+      to: 'SOL',
+      amount: '0.0000001',
+      'amount-unit': 'usd',
+    })).rejects.toMatchObject({
+      code: 'INVALID_INPUT',
+      message: expect.stringMatching(/resolves to 0 base units.*swap of nothing/s),
+    });
+
+    // No quote request may be sent for a zero amount.
+    expect(fetchCalls.find(c => c.url.includes('quote'))).toBeUndefined();
 
     global.fetch = origFetch;
     delete process.env.NANSEN_WALLET_PASSWORD;
